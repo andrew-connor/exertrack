@@ -421,7 +421,7 @@ private fun DetailRow(label: String, value: String) {
             text = label,
             style = MaterialTheme.typography.bodyMedium,
             color = ExColors.textDim,
-            modifier = Modifier.width(80.dp),
+            modifier = Modifier.width(96.dp),
         )
         Text(
             text = value,

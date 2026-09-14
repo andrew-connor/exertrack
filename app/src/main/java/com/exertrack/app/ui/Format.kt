@@ -43,16 +43,20 @@ object Format {
     fun counter(state: SessionState): String {
         val rows = state.rows.size
         if (rows == 0) return "0/0"
-        val idx = if (state.phase == com.exertrack.app.engine.Phase.FINISHED) rows else state.rowIndex + 1
+        val idx = if (finishedEverything(state)) rows else state.rowIndex + 1
         return "$idx/$rows"
     }
 
     /** "Round 2 of 3", or null when the workout has a single round. */
     fun roundLabel(state: SessionState): String? {
         if (state.rounds <= 1) return null
-        val r = if (state.phase == com.exertrack.app.engine.Phase.FINISHED) state.rounds else state.round + 1
+        val r = if (finishedEverything(state)) state.rounds else state.round + 1
         return "Round $r of ${state.rounds}"
     }
+
+    /** A finished session that ran to the end; a stopped one keeps showing where it stopped. */
+    private fun finishedEverything(state: SessionState): Boolean =
+        state.phase == com.exertrack.app.engine.Phase.FINISHED && state.completedCount >= state.totalSteps
 
     private val dateFmt = DateTimeFormatter.ofPattern("EEE, MMM d, yyyy", Locale.US)
     private val timeFmt = DateTimeFormatter.ofPattern("h:mm a", Locale.US)
