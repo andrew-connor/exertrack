@@ -82,6 +82,11 @@ class WorkoutService : Service() {
     private var wakeLock: PowerManager.WakeLock? = null
     private var wakeLockAcquiredAt = 0L
     private var lastKey: NotificationKey? = null
+    /**
+     * phaseElapsedMs of the last state that was posted. It only ever decreases when the engine
+     * re-enters a phase, which restarts the clock the notification's chronometer was built from.
+     */
+    private var lastPhaseElapsedMs = 0L
     /** True once startForeground has succeeded; state updates are ignored before that. */
     private var foregroundStarted = false
 
@@ -144,7 +149,12 @@ class WorkoutService : Service() {
         }
         updateWakeLock(state)
         val key = keyOf(state)
-        if (key != lastKey) {
+        // A phase re-entered on the same step (Back on step 0, "Start from here" on the current
+        // step) yields an identical key but resets the phase clock; the chronometer must be
+        // rebuilt or it keeps counting to the old deadline.
+        val phaseRestarted = state.phaseElapsedMs < lastPhaseElapsedMs
+        lastPhaseElapsedMs = state.phaseElapsedMs
+        if (key != lastKey || phaseRestarted) {
             lastKey = key
             notify(buildNotification(state))
         }
@@ -156,6 +166,7 @@ class WorkoutService : Service() {
             startForeground(NOTIFICATION_ID, buildNotification(state), ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
             foregroundStarted = true
             lastKey = keyOf(state)
+            lastPhaseElapsedMs = state.phaseElapsedMs
             true
         } catch (e: Exception) {
             Log.w(TAG, "startForeground failed", e)
@@ -167,6 +178,7 @@ class WorkoutService : Service() {
         releaseWakeLock()
         foregroundStarted = false
         lastKey = null
+        lastPhaseElapsedMs = 0L
         try {
             stopForeground(STOP_FOREGROUND_REMOVE)
         } catch (e: Exception) {

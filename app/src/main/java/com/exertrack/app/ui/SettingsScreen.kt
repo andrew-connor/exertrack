@@ -1,6 +1,7 @@
 package com.exertrack.app.ui
 
 import android.content.pm.PackageManager
+import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
@@ -32,11 +33,13 @@ import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -64,6 +67,10 @@ fun SettingsScreen(onBack: () -> Unit) {
     val scope = rememberCoroutineScope()
     val snackbar = remember { SnackbarHostState() }
 
+    // The picked backup file is saveable state, so the restore confirmation survives recreation
+    // (rotation, background kill) while the file picker or the dialog is up; the parsed contents
+    // are rebuilt from it below rather than kept across recreation.
+    var restoreUri by rememberSaveable { mutableStateOf<Uri?>(null) }
     var pendingRestore by remember { mutableStateOf<Backup.Data?>(null) }
 
     fun notify(message: String) {
@@ -98,17 +105,26 @@ fun SettingsScreen(onBack: () -> Unit) {
     }
 
     val restoreLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
-        if (uri != null) {
-            scope.launch {
-                val result = withContext(Dispatchers.IO) {
-                    runCatching { Backup.parse(String(Files.readBytes(context, uri), Charsets.UTF_8)) }
-                }
-                result.fold(
-                    onSuccess = { pendingRestore = it },
-                    onFailure = { snackbar.showSnackbar("Could not read the backup: ${it.message ?: "unreadable file"}") },
-                )
-            }
+        if (uri != null) restoreUri = uri
+    }
+
+    LaunchedEffect(restoreUri) {
+        val uri = restoreUri
+        if (uri == null) {
+            pendingRestore = null
+            return@LaunchedEffect
         }
+        val result = withContext(Dispatchers.IO) {
+            runCatching { Backup.parse(String(Files.readBytes(context, uri), Charsets.UTF_8)) }
+        }
+        result.fold(
+            onSuccess = { pendingRestore = it },
+            onFailure = {
+                // notify() runs on the screen scope, so clearing the key here cannot cancel it.
+                notify("Could not read the backup: ${it.message ?: "unreadable file"}")
+                restoreUri = null
+            },
+        )
     }
 
     val versionName = remember {
@@ -248,11 +264,15 @@ fun SettingsScreen(onBack: () -> Unit) {
             confirmLabel = "Replace",
             destructive = true,
             onConfirm = {
+                restoreUri = null
                 pendingRestore = null
                 repository.replaceAll(data.workouts, data.log, data.settings)
                 notify("Backup restored")
             },
-            onDismiss = { pendingRestore = null },
+            onDismiss = {
+                restoreUri = null
+                pendingRestore = null
+            },
         )
     }
 }

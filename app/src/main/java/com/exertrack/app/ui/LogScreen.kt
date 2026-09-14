@@ -50,6 +50,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.exertrack.app.AppGraph
 import com.exertrack.app.data.LogEntry
+import com.exertrack.app.data.SessionStatus
 import com.exertrack.app.io.Exporters
 import com.exertrack.app.ui.theme.ExColors
 import kotlinx.coroutines.Dispatchers
@@ -357,7 +358,11 @@ private fun LogDetailDialog(
     onDelete: () -> Unit,
     onClose: () -> Unit,
 ) {
-    var notes by remember(entry.id) { mutableStateOf(entry.notes) }
+    // Saveable so a draft typed before rotation survives together with the dialog itself.
+    var notes by rememberSaveable(entry.id) { mutableStateOf(entry.notes) }
+    // The engine still owns a running session's entry and rewrites it on every transition,
+    // so deleting it here would only be undone; discard it from the workout screen instead.
+    val running = entry.status == SessionStatus.IN_PROGRESS
 
     AlertDialog(
         onDismissRequest = onClose,
@@ -375,6 +380,14 @@ private fun LogDetailDialog(
                 DetailRow("Steps", "${entry.completedSteps}/${entry.totalSteps}")
                 DetailRow("Rounds", entry.rounds.toString())
                 DetailRow("Status", statusText(entry))
+                if (running) {
+                    Text(
+                        text = "This session is still running.",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = ExColors.textDim,
+                        modifier = Modifier.padding(top = 4.dp),
+                    )
+                }
                 OutlinedTextField(
                     value = notes,
                     onValueChange = { notes = it },
@@ -392,7 +405,9 @@ private fun LogDetailDialog(
         },
         dismissButton = {
             Row {
-                TextButton(onClick = onDelete) { Text("Delete", color = ExColors.danger) }
+                if (!running) {
+                    TextButton(onClick = onDelete) { Text("Delete", color = ExColors.danger) }
+                }
                 TextButton(onClick = onClose) { Text("Close") }
             }
         },

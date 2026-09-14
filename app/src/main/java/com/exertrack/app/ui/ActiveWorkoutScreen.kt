@@ -57,6 +57,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -121,9 +122,11 @@ fun ActiveWorkoutScreen(
     val loadedWorkout = state.workout?.let { shown -> workouts.firstOrNull { it.id == shown.id } ?: shown }
     val otherWorkoutRunning = state.isActive && state.workout != null && state.workout?.id != workoutId
 
-    var showEndSheet by remember { mutableStateOf(false) }
-    var editStep by remember { mutableStateOf<Int?>(null) }
-    var jumpStep by remember { mutableStateOf<Int?>(null) }
+    // Saveable so a configuration change or process restart brings the open sheet or dialog
+    // back (RowEditSheet restores its own typed fields once it is composed again).
+    var showEndSheet by rememberSaveable { mutableStateOf(false) }
+    var editStep by rememberSaveable { mutableStateOf<Int?>(null) }
+    var jumpStep by rememberSaveable { mutableStateOf<Int?>(null) }
     var menuOpen by remember { mutableStateOf(false) }
     var notesExpanded by remember(state.stepIndex) { mutableStateOf(false) }
 
@@ -315,7 +318,10 @@ fun ActiveWorkoutScreen(
             onDiscard = {
                 showEndSheet = false
                 engine.endSession(keepLog = false)
-                onBack()
+                // The session may have completed on its own while the sheet was sliding away.
+                // The engine is then FINISHED (endSession was a no-op) and the completion dialog
+                // takes over; leaving now would strand that state with no screen to acknowledge it.
+                if (engine.state.value.phase == Phase.IDLE) onBack()
             },
         )
     }

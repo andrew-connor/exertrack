@@ -49,6 +49,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.exertrack.app.AppGraph
 import com.exertrack.app.data.ExerciseRow
+import com.exertrack.app.data.Repository
 import com.exertrack.app.data.Workout
 import com.exertrack.app.data.newId
 import com.exertrack.app.ui.theme.ExColors
@@ -118,8 +119,8 @@ fun EditorScreen(
     var nameText by rememberSaveable(workoutId) { mutableStateOf(workout.name) }
     var roundsText by rememberSaveable(workoutId) { mutableStateOf(workout.rounds.toString()) }
     var leadInText by rememberSaveable(workoutId) { mutableStateOf(workout.leadInSec.toString()) }
-    val roundsValue = roundsText.trim().toIntOrNull()?.takeIf { it >= 1 }
-    val leadInValue = leadInText.trim().toIntOrNull()?.takeIf { it in 0..60 }
+    val roundsValue = roundsText.trim().toIntOrNull()?.takeIf { it in 1..Repository.MAX_ROUNDS }
+    val leadInValue = leadInText.trim().toIntOrNull()?.takeIf { it in 0..Repository.MAX_LEAD_IN_SEC }
 
     // ---- sheets and dialogs ----
     var editingRowId by rememberSaveable(workoutId) { mutableStateOf<String?>(null) }
@@ -183,13 +184,13 @@ fun EditorScreen(
                             value = roundsText,
                             onValueChange = { text ->
                                 roundsText = text
-                                text.trim().toIntOrNull()?.takeIf { it >= 1 }?.let { v -> persist { it.copy(rounds = v) } }
+                                text.trim().toIntOrNull()?.takeIf { it in 1..Repository.MAX_ROUNDS }?.let { v -> persist { it.copy(rounds = v) } }
                             },
                             label = { Text("Rounds") },
                             singleLine = true,
                             enabled = !locked,
                             isError = roundsValue == null,
-                            supportingText = if (roundsValue == null) ({ Text("1 or more") }) else null,
+                            supportingText = if (roundsValue == null) ({ Text("1 to ${Repository.MAX_ROUNDS}") }) else null,
                             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number, imeAction = ImeAction.Next),
                             modifier = Modifier.weight(1f),
                         )
@@ -197,12 +198,12 @@ fun EditorScreen(
                             value = leadInText,
                             onValueChange = { text ->
                                 leadInText = text
-                                text.trim().toIntOrNull()?.takeIf { it in 0..60 }?.let { v -> persist { it.copy(leadInSec = v) } }
+                                text.trim().toIntOrNull()?.takeIf { it in 0..Repository.MAX_LEAD_IN_SEC }?.let { v -> persist { it.copy(leadInSec = v) } }
                             },
                             label = { Text("Lead-in seconds") },
                             singleLine = true,
                             isError = leadInValue == null,
-                            supportingText = if (leadInValue == null) ({ Text("0 to 60") }) else null,
+                            supportingText = if (leadInValue == null) ({ Text("0 to ${Repository.MAX_LEAD_IN_SEC}") }) else null,
                             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number, imeAction = ImeAction.Done),
                             modifier = Modifier.weight(1f),
                         )

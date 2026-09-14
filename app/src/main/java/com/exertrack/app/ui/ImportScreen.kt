@@ -43,10 +43,12 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
@@ -56,7 +58,6 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.exertrack.app.AppGraph
 import com.exertrack.app.data.Workout
-import com.exertrack.app.engine.SessionState
 import com.exertrack.app.io.ParsedRow
 import com.exertrack.app.ui.theme.ExColors
 import kotlinx.coroutines.Dispatchers
@@ -91,11 +92,16 @@ fun ImportScreen(
     // Guards the automatic picker launch so a recreated activity does not open a second picker.
     var pickerLaunched by rememberSaveable { mutableStateOf(initialUri != null) }
     var load by remember { mutableStateOf<LoadState>(LoadState.Idle) }
-    var outcome by remember { mutableStateOf<ImportOutcome?>(null) }
+    // The file is re-read after recreation; the per-sheet choices and the completion dialog are
+    // kept in saveable state and put back on the re-parsed model.
+    val choices = rememberSaveable(saver = SheetChoicesSaver) { mutableStateMapOf<Int, SheetChoice>() }
+    var outcome by rememberSaveable(stateSaver = ImportOutcomeSaver) { mutableStateOf<ImportOutcome?>(null) }
 
     val picker = rememberLauncherForActivityResult(PersistableOpenDocument) { picked ->
         if (picked != null) {
             takePersistableRead(context, picked)
+            // Choices belong to the sheets of one file; a different file starts from the defaults.
+            if (picked != uri) choices.clear()
             uri = picked
         } else if (uri == null) {
             onDone()
@@ -115,13 +121,27 @@ fun ImportScreen(
         val known = repository.workouts.value
         val result = withContext(Dispatchers.IO) { runCatching { readImportFile(context, target) } }
         load = result.fold(
-            onSuccess = { file -> LoadState.Loaded(buildImportModel(target, file, replaceWorkoutId, known)) },
+            onSuccess = { file ->
+                val built = buildImportModel(target, file, replaceWorkoutId, known)
+                built.items.forEach { item -> choices[item.index]?.let(item::applyChoice) }
+                LoadState.Loaded(built)
+            },
             onFailure = { e -> LoadState.Failed(e.message?.takeIf { it.isNotBlank() } ?: "Could not read the file") },
         )
     }
 
     val model = (load as? LoadState.Loaded)?.model
-    val canImport = model != null && model.items.any { it.resolve(workouts, session).target != ImportTarget.Skip }
+
+    // Mirror every target, name and preview toggle into the saveable choice map as it changes.
+    LaunchedEffect(model) {
+        val current = model ?: return@LaunchedEffect
+        snapshotFlow { current.items.map(SheetItem::currentChoice) }
+            .collect { list -> list.forEachIndexed { i, choice -> choices[current.items[i].index] = choice } }
+    }
+
+    // One resolution pass shared by the cards, the Import button and applyImport.
+    val resolvedAll = model?.let { resolveAll(it.items, workouts, session) }.orEmpty()
+    val canImport = resolvedAll.any { it.target != ImportTarget.Skip }
 
     Scaffold(
         containerColor = ExColors.background,
@@ -179,8 +199,8 @@ fun ImportScreen(
             )
             is LoadState.Loaded -> MappingList(
                 model = stage.model,
+                resolved = resolvedAll,
                 workouts = workouts,
-                session = session,
                 modifier = Modifier.padding(padding),
             )
         }
@@ -245,8 +265,9 @@ private fun ErrorCard(message: String, modifier: Modifier, onPickAnother: () -> 
 @Composable
 private fun MappingList(
     model: ImportModel,
+    /** One entry per sheet in sheet order, from [resolveAll]. */
+    resolved: List<ResolvedTarget>,
     workouts: List<Workout>,
-    session: SessionState,
     modifier: Modifier,
 ) {
     val replaceOptions = remember(workouts) { workouts.sortedBy { it.name.lowercase() } }
@@ -271,7 +292,7 @@ private fun MappingList(
             }
         }
         items(model.items, key = { it.index }) { item ->
-            SheetCard(item = item, workouts = workouts, replaceOptions = replaceOptions, session = session)
+            SheetCard(item = item, resolved = resolved[item.index], workouts = workouts, replaceOptions = replaceOptions)
         }
     }
 }
@@ -280,11 +301,10 @@ private fun MappingList(
 @Composable
 private fun SheetCard(
     item: SheetItem,
+    resolved: ResolvedTarget,
     workouts: List<Workout>,
     replaceOptions: List<Workout>,
-    session: SessionState,
 ) {
-    val resolved = item.resolve(workouts, session)
     val blocked = item.isBlocked
     var menuOpen by remember { mutableStateOf(false) }
 

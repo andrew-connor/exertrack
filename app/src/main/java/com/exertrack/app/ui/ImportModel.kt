@@ -5,8 +5,11 @@ import android.content.Intent
 import android.net.Uri
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.saveable.listSaver
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshots.SnapshotStateMap
 import com.exertrack.app.data.Repository
 import com.exertrack.app.data.Workout
 import com.exertrack.app.engine.SessionState
@@ -106,9 +109,12 @@ internal fun readImportFile(context: Context, uri: Uri): ImportFile {
 }
 
 /**
- * Build the mapping list with the defaults from docs/DESIGN.md: the first sheet replaces
- * [replaceWorkoutId] when given, a sheet named like an existing workout replaces that workout,
- * everything else becomes a new workout; empty sheets and sheets with problems are skipped.
+ * Build the mapping list with the defaults from docs/DESIGN.md. With [replaceWorkoutId] (the
+ * editor's "Replace rows from file" and "Re-import from source"), exactly one sheet replaces that
+ * workout, chosen by [sheetIndexFor], and every other sheet defaults to Skip so a single-workout
+ * re-import never creates or replaces anything else. Without it, a sheet named like an existing
+ * workout replaces that workout and everything else becomes a new workout. Empty sheets and sheets
+ * with problems are always skipped.
  */
 internal fun buildImportModel(
     uri: Uri,
@@ -117,13 +123,15 @@ internal fun buildImportModel(
     workouts: List<Workout>,
 ): ImportModel {
     val csvStem = SpreadsheetImport.sheetNameFor(file.name)
+    val replaceTarget = replaceWorkoutId?.let { id -> workouts.firstOrNull { it.id == id } }
+    val replaceIndex = replaceTarget?.let { sheetIndexFor(it, file) }
     val items = file.tables.mapIndexed { index, table ->
         val defaultName = if (file.isXlsx) table.sheetName.trim().ifEmpty { "Sheet ${index + 1}" } else csvStem
         val blocked = table.isEmpty || table.problemCount > 0
         val target: ImportTarget = when {
             blocked -> ImportTarget.Skip
-            index == 0 && replaceWorkoutId != null && workouts.any { it.id == replaceWorkoutId } ->
-                ImportTarget.Replace(replaceWorkoutId)
+            replaceTarget != null ->
+                if (index == replaceIndex) ImportTarget.Replace(replaceTarget.id) else ImportTarget.Skip
             else -> {
                 val sameName = workouts.firstOrNull { it.name.trim().equals(defaultName.trim(), ignoreCase = true) }
                 if (sameName != null) ImportTarget.Replace(sameName.id) else ImportTarget.NewWorkout
@@ -132,6 +140,22 @@ internal fun buildImportModel(
         SheetItem(index = index, table = table, defaultName = defaultName, initialTarget = target)
     }
     return ImportModel(uri = uri, fileName = file.name, isXlsx = file.isXlsx, items = items)
+}
+
+/**
+ * The sheet whose rows should replace [target]: the sheet it was imported from when [file] is a
+ * workbook that still has it, else a sheet named like the workout, else the first sheet (CSV, or a
+ * different file chosen via "Replace rows from file").
+ */
+private fun sheetIndexFor(target: Workout, file: ImportFile): Int {
+    val names = file.tables.map { it.sheetName.trim() }
+    val stored = target.sourceSheet?.trim().orEmpty()
+    if (file.isXlsx && stored.isNotEmpty()) {
+        val bySource = names.indexOfFirst { it.equals(stored, ignoreCase = true) }
+        if (bySource >= 0) return bySource
+    }
+    val byName = names.indexOfFirst { it.equals(target.name.trim(), ignoreCase = true) }
+    return if (byName >= 0) byName else 0
 }
 
 /** Apply the block / running-workout guards to the user's choice. */
@@ -148,6 +172,22 @@ internal fun SheetItem.resolve(workouts: List<Workout>, session: SessionState): 
             }
         }
         ImportTarget.NewWorkout, ImportTarget.Skip -> ResolvedTarget(chosen, null)
+    }
+}
+
+/**
+ * Resolve every sheet in order. A later sheet that would replace a workout an earlier sheet already
+ * replaces is skipped with a visible reason, so one workout is never written twice in a pass and the
+ * cards, the Import button and [applyImport] all agree on what will happen.
+ */
+internal fun resolveAll(items: List<SheetItem>, workouts: List<Workout>, session: SessionState): List<ResolvedTarget> {
+    val claimedBy = HashMap<String, SheetItem>() // workout id -> first sheet replacing it
+    return items.map { item ->
+        val resolved = item.resolve(workouts, session)
+        val target = resolved.target as? ImportTarget.Replace ?: return@map resolved
+        val first = claimedBy.putIfAbsent(target.workoutId, item) ?: return@map resolved
+        val name = workouts.first { it.id == target.workoutId }.name
+        ResolvedTarget(ImportTarget.Skip, "$name is already replaced by sheet ${first.index + 1}; choose another target")
     }
 }
 
@@ -171,19 +211,75 @@ internal class ImportOutcome(val created: Int, val replaced: Int) {
         }
 }
 
+/** Saves the completion dialog's counts so it survives recreation; nothing is saved while null. */
+internal val ImportOutcomeSaver = listSaver<ImportOutcome?, Int>(
+    save = { outcome -> if (outcome == null) emptyList() else listOf(outcome.created, outcome.replaced) },
+    restore = { saved -> if (saved.size == 2) ImportOutcome(saved[0], saved[1]) else null },
+)
+
 /**
- * Apply every mapping in one pass. New workouts get a unique name and remember the source file
- * and sheet; replaced workouts keep their id, name, rounds and lead-in. A replaced workout that is
- * loaded (idle or finished) in the engine is reloaded so the active screen shows the new rows.
+ * One sheet's choices, kept outside the parsed model so they survive activity recreation: the file
+ * is cheap to re-read, the user's mapping is not.
+ */
+internal class SheetChoice(val target: ImportTarget, val newName: String, val expanded: Boolean)
+
+internal fun SheetItem.currentChoice(): SheetChoice = SheetChoice(target, newName, expanded)
+
+/** Put a saved choice back on a freshly parsed sheet. A blocked sheet keeps its forced Skip. */
+internal fun SheetItem.applyChoice(choice: SheetChoice) {
+    if (!isBlocked) {
+        target = choice.target
+        newName = choice.newName
+    }
+    expanded = choice.expanded
+}
+
+private const val CHOICE_FIELDS = 5
+
+/** Flat string list, [CHOICE_FIELDS] entries per sheet: index, kind, workout id, expanded, name (last, so any text is safe). */
+internal val SheetChoicesSaver = listSaver<SnapshotStateMap<Int, SheetChoice>, String>(
+    save = { map ->
+        map.entries.flatMap { (index, choice) ->
+            val (kind, workoutId) = when (val target = choice.target) {
+                ImportTarget.NewWorkout -> "new" to ""
+                is ImportTarget.Replace -> "replace" to target.workoutId
+                ImportTarget.Skip -> "skip" to ""
+            }
+            listOf(index.toString(), kind, workoutId, choice.expanded.toString(), choice.newName)
+        }
+    },
+    restore = { flat ->
+        mutableStateMapOf<Int, SheetChoice>().apply {
+            flat.chunked(CHOICE_FIELDS).forEach { fields ->
+                if (fields.size != CHOICE_FIELDS) return@forEach
+                val (index, kind, workoutId, expanded, name) = fields
+                val target = when (kind) {
+                    "replace" -> ImportTarget.Replace(workoutId)
+                    "skip" -> ImportTarget.Skip
+                    else -> ImportTarget.NewWorkout
+                }
+                index.toIntOrNull()?.let { this[it] = SheetChoice(target, name, expanded.toBoolean()) }
+            }
+        }
+    },
+)
+
+/**
+ * Apply every mapping in one pass, as resolved by [resolveAll]. New workouts get a unique name and
+ * remember the source file and sheet; replaced workouts keep their id, name, rounds and lead-in. A
+ * replaced workout that is loaded (idle or finished) in the engine is reloaded so the active screen
+ * shows the new rows.
  */
 internal fun applyImport(model: ImportModel, repository: Repository, engine: WorkoutEngine): ImportOutcome {
     val now = System.currentTimeMillis()
     val source = model.uri.toString()
     var created = 0
     var replaced = 0
-    for (item in model.items) {
-        val session = engine.state.value
-        val resolved = item.resolve(repository.workouts.value, session)
+    // One resolution pass, the same one the screen showed: within this synchronous loop the only
+    // changes are our own saves, which add or rewrite workouts and never change a guard's outcome.
+    val session = engine.state.value
+    val resolvedAll = resolveAll(model.items, repository.workouts.value, session)
+    for ((item, resolved) in model.items.zip(resolvedAll)) {
         val sheet = if (model.isXlsx) item.table.sheetName else null
         val rows = item.table.exercises
         when (val target = resolved.target) {

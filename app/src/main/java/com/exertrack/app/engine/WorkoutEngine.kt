@@ -70,8 +70,15 @@ class WorkoutEngine(
     fun load(workout: Workout) {
         if (isActive && this.workout?.id != workout.id) return
         if (isActive) { updateWorkout(workout); return }
+        if (phase == Phase.FINISHED && this.workout?.id == workout.id) {
+            // Same workout re-opened after it finished: keep the completion dialog until Save.
+            this.workout = workout
+            publish()
+            return
+        }
+        // IDLE, or FINISHED for a different workout: that session is already closed in the log,
+        // so drop it and show the requested workout in IDLE.
         this.workout = workout
-        if (phase == Phase.FINISHED) return
         resetInternals()
         publish()
     }
@@ -176,7 +183,9 @@ class WorkoutEngine(
         pauseStartedAt = null
         paused = false
         segmentStartedAt = now
-        lastTickSecond = -1
+        // Do not replay the warning tick for the second already on screen; a fresh countdown
+        // (setPhase) still starts from -1.
+        lastTickSecond = phaseDurationMs?.let { ((it - phaseElapsedBeforeSegment + 999) / 1000).toInt() } ?: -1
         ensureTicker()
         writeSnapshot(force = true)
         publish()
@@ -194,6 +203,7 @@ class WorkoutEngine(
         if (keepLog) {
             finish(SessionStatus.STOPPED)
         } else {
+            cues.stopSpeaking()
             logEntry?.let { store.deleteLog(it.id) }
             stopTicker()
             store.saveSnapshot(null)
@@ -394,7 +404,7 @@ class WorkoutEngine(
         phase = Phase.FINISHED
         phaseDurationMs = null
         val wallNow = clock.wallTime()
-        val entry = (logEntry ?: return).copy(
+        val entry = (currentLogEntry() ?: return).copy(
             status = status,
             finishedAt = wallNow,
             elapsedSec = totalElapsedSec(wallNow),
@@ -467,8 +477,11 @@ class WorkoutEngine(
     private fun currentPausedMs(now: Long): Long =
         pausedMsAccum + (pauseStartedAt?.let { now - it } ?: 0L)
 
+    /** The session's log entry as the store currently has it (the user may have edited its notes on the Log screen). */
+    private fun currentLogEntry(): LogEntry? = logEntry?.let { store.findLog(it.id) ?: it }
+
     private fun updateLog() {
-        val entry = logEntry ?: return
+        val entry = currentLogEntry() ?: return
         val wallNow = clock.wallTime()
         val now = clock.elapsedRealtime()
         logEntry = entry.copy(

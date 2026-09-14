@@ -4,6 +4,7 @@ import android.content.Context
 import android.media.AudioAttributes
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
 import android.util.Log
@@ -12,8 +13,11 @@ import java.util.Locale
 /**
  * Thin wrapper over the platform TextToSpeech. Initialisation is asynchronous: utterances
  * requested before the engine is ready are queued and flushed once it is (or dropped if the
- * engine fails). Uses USAGE_MEDIA audio attributes so speech follows the chimes to earbuds.
- * [onSpeechStart] / [onSpeechDone] let AudioCues hold audio focus while speaking.
+ * engine fails). A failed engine is not final: [prepare] always tries again and [speak] retries
+ * after a short cooldown, so a transient failure (engine package being updated, voice data
+ * still downloading) does not silence speech for the rest of the process. Uses USAGE_MEDIA
+ * audio attributes so speech follows the chimes to earbuds. [onSpeechStart] / [onSpeechDone]
+ * let AudioCues hold audio focus while speaking.
  */
 class Speaker(
     private val context: Context,
@@ -24,6 +28,8 @@ class Speaker(
         const val TAG = "Speaker"
         const val UTTERANCE_PREFIX = "exertrack-"
         const val WARM_UP_ID = "exertrack-warm-up"
+        /** Minimum gap between engine retries triggered by ordinary utterances. */
+        const val RETRY_DELAY_MS = 10_000L
     }
 
     private enum class EngineState { NONE, INITIALIZING, READY, FAILED }
@@ -35,6 +41,10 @@ class Speaker(
     private val pending = ArrayDeque<Pair<String, Boolean>>()
     private var utteranceCounter = 0L
     private var warmUpRequested = false
+    /** elapsedRealtime of the last failure; gates cooldown retries from [speak]. */
+    private var failedAt = 0L
+    /** Bumped whenever an engine is created or discarded so stale init callbacks are ignored. */
+    private var initGeneration = 0
 
     private val progressListener = object : UtteranceProgressListener() {
         override fun onStart(utteranceId: String?) {
@@ -64,10 +74,14 @@ class Speaker(
             utteranceId != null && utteranceId != WARM_UP_ID && utteranceId.startsWith(UTTERANCE_PREFIX)
     }
 
-    /** Start engine initialisation (idempotent) and speak a silent utterance to warm it up. */
+    /**
+     * Start engine initialisation (idempotent) and speak a silent utterance to warm it up.
+     * A session start is a deliberate user action, so a previously failed engine is retried
+     * immediately rather than waiting out the cooldown.
+     */
     fun prepare() {
         warmUpRequested = true
-        ensureEngine()
+        ensureEngine(retryFailedNow = true)
         if (engineState == EngineState.READY) warmUp()
     }
 
@@ -100,6 +114,8 @@ class Speaker(
         val engine = tts
         tts = null
         engineState = EngineState.NONE
+        // A late init callback from this engine must not be attributed to a later one.
+        initGeneration++
         if (engine != null) {
             try {
                 engine.shutdown()
@@ -111,13 +127,28 @@ class Speaker(
 
     // ---- internals ----
 
-    private fun ensureEngine() {
-        if (engineState != EngineState.NONE) return
+    /**
+     * Create the engine if there is none. A failed engine is recreated when [retryFailedNow] is
+     * set, or once [RETRY_DELAY_MS] has passed since the failure, so a persistently missing
+     * engine costs at most one bind attempt per cooldown.
+     */
+    private fun ensureEngine(retryFailedNow: Boolean = false) {
+        when (engineState) {
+            EngineState.INITIALIZING, EngineState.READY -> return
+            EngineState.FAILED ->
+                if (!retryFailedNow && SystemClock.elapsedRealtime() - failedAt < RETRY_DELAY_MS) return
+            EngineState.NONE -> Unit
+        }
         engineState = EngineState.INITIALIZING
+        val generation = ++initGeneration
         try {
             // The init callback is posted so it always runs after the constructor has returned,
             // even when no engine is installed and the platform reports the failure synchronously.
-            tts = TextToSpeech(context.applicationContext) { status -> mainHandler.post { onInit(status) } }
+            // The generation check drops callbacks from an engine that has since been replaced
+            // or shut down.
+            tts = TextToSpeech(context.applicationContext) { status ->
+                mainHandler.post { if (generation == initGeneration) onInit(status) }
+            }
         } catch (e: Exception) {
             Log.w(TAG, "Text-to-speech engine unavailable", e)
             fail()
@@ -167,6 +198,7 @@ class Speaker(
 
     private fun fail() {
         engineState = EngineState.FAILED
+        failedAt = SystemClock.elapsedRealtime()
         pending.clear()
         val engine = tts
         tts = null

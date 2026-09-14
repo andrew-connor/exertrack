@@ -19,6 +19,11 @@ import java.util.concurrent.Executors
  */
 class Repository(private val dir: File) : SessionStore {
 
+    companion object {
+        const val MAX_ROUNDS = 99
+        const val MAX_LEAD_IN_SEC = 60
+    }
+
     private val workoutsFile = File(dir, "workouts.json")
     private val logFile = File(dir, "log.json")
     private val settingsFile = File(dir, "settings.json")
@@ -62,8 +67,8 @@ class Repository(private val dir: File) : SessionStore {
         val stored = w.copy(
             name = w.name.trim().ifEmpty { "Untitled workout" },
             rows = w.rows.map { it.normalized() },
-            rounds = w.rounds.coerceAtLeast(1),
-            leadInSec = w.leadInSec.coerceIn(0, 60),
+            rounds = w.rounds.coerceIn(1, MAX_ROUNDS),
+            leadInSec = w.leadInSec.coerceIn(0, MAX_LEAD_IN_SEC),
             updatedAt = now,
         )
         _workouts.update { list ->

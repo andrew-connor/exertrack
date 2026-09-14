@@ -31,9 +31,10 @@ class WorkoutEngineTest {
         val chimes = mutableListOf<ChimeKind>()
         val spoken = mutableListOf<String>()
         var prepared = 0
+        var stops = 0
         override fun chime(kind: ChimeKind) { chimes += kind }
         override fun speak(text: String, interrupt: Boolean) { spoken += text }
-        override fun stopSpeaking() {}
+        override fun stopSpeaking() { stops++ }
         override fun prepare() { prepared++ }
     }
 
@@ -334,10 +335,64 @@ class WorkoutEngineTest {
 
         h.engine.primaryTap()
         val id2 = h.state.sessionId!!
+        val stopsBefore = h.cues.stops
         h.engine.endSession(keepLog = false)
         assertEquals(Phase.IDLE, h.state.phase)
         assertNull(h.store.log[id2])
         assertNull(h.store.snapshot)
+        assertEquals(stopsBefore + 1, h.cues.stops) // discarding also silences speech in progress
+    }
+
+    @Test
+    fun `loading a different workout after a finish returns to IDLE with that workout`() = runTest {
+        val h = Harness(this)
+        h.engine.load(workout(leadIn = 0))
+        h.engine.jumpTo(2)
+        advance(10_000)
+        assertEquals(Phase.FINISHED, h.state.phase)
+        // re-opening the same workout keeps the completion dialog
+        h.engine.load(workout(leadIn = 0))
+        assertEquals(Phase.FINISHED, h.state.phase)
+        assertNotNull(h.state.finishedEntry)
+
+        val other = workout(leadIn = 0).copy(id = "other", name = "Other")
+        h.engine.load(other)
+        assertEquals(Phase.IDLE, h.state.phase)
+        assertEquals("other", h.state.workout?.id)
+        assertNull(h.state.finishedEntry)
+        assertTrue(h.state.completedSteps.isEmpty())
+    }
+
+    @Test
+    fun `notes edited on the log entry mid-session survive the engine's updates`() = runTest {
+        val h = Harness(this)
+        h.engine.load(workout(leadIn = 0))
+        h.engine.primaryTap()
+        advance(5_000)
+        val id = h.state.sessionId!!
+        h.store.log[id] = h.store.log[id]!!.copy(notes = "felt strong")
+        advance(35_000) // step completes -> updateLog
+        assertEquals("felt strong", h.store.log[id]?.notes)
+        h.engine.endSession(keepLog = true)
+        assertEquals("felt strong", h.store.log[id]?.notes)
+        assertEquals("felt strong", h.state.finishedEntry?.notes)
+    }
+
+    @Test
+    fun `resuming does not replay the warning tick for the second on screen`() = runTest {
+        val h = Harness(this)
+        h.engine.load(workout(leadIn = 0))
+        h.engine.primaryTap()
+        advance(37_600) // 2.4 s left: the "3" tick has played
+        val ticksBefore = h.cues.chimes.count { it == ChimeKind.TICK }
+        h.engine.pause()
+        advance(5_000)
+        h.engine.resume()
+        advance(300)
+        assertEquals(ticksBefore, h.cues.chimes.count { it == ChimeKind.TICK })
+        advance(200) // crosses into the "2" second
+        assertEquals(ticksBefore + 1, h.cues.chimes.count { it == ChimeKind.TICK })
+        h.engine.stopForTest()
     }
 
     @Test

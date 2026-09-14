@@ -24,19 +24,19 @@ import com.exertrack.app.ui.AppRoot
 import com.exertrack.app.ui.theme.ExertrackTheme
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.drop
+import kotlinx.coroutines.flow.filter
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 
 /**
  * Single activity. Edge-to-edge, hands shared/viewed file URIs (ACTION_SEND EXTRA_STREAM /
  * ACTION_VIEW data, also via onNewIntent) to [AppRoot] as pendingImport, keeps the screen on
- * while a session is active and Settings.keepScreenOn, and asks for POST_NOTIFICATIONS once.
+ * while a session is active and Settings.keepScreenOn, and asks for POST_NOTIFICATIONS on a
+ * cold launch and again whenever a session starts while it is still missing (the platform
+ * shows the dialog at most twice per install, so this never nags).
  */
 class MainActivity : ComponentActivity() {
-
-    private companion object {
-        const val PREFS = "exertrack"
-        const val KEY_NOTIFICATIONS_ASKED = "notifications_asked"
-    }
 
     /** A file handed to the app that the Import screen has not picked up yet. */
     private var pendingImport by mutableStateOf<Uri?>(null)
@@ -53,8 +53,13 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         // A recreated activity (rotation, process restart) gets the same intent again; the
         // original creation already handed that file over.
-        if (savedInstanceState == null) pendingImport = importUriFrom(intent)
-        requestNotificationPermissionOnce()
+        if (savedInstanceState == null) {
+            pendingImport = importUriFrom(intent)
+            // Ask up front so even the first workout has its lock-screen controls; a
+            // recreated activity does not ask again.
+            requestNotificationPermissionIfMissing()
+        }
+        observeNotificationPermission()
         observeKeepScreenOn()
         setContent {
             ExertrackTheme {
@@ -75,14 +80,32 @@ class MainActivity : ComponentActivity() {
         else -> null
     }
 
-    private fun requestNotificationPermissionOnce() {
+    /**
+     * Without POST_NOTIFICATIONS the foreground service still runs but its notification (and
+     * the Pause / Skip / End actions on the lock screen) is not shown. Once the user has denied
+     * twice, launch() reports the denial without showing any dialog.
+     */
+    private fun requestNotificationPermissionIfMissing() {
         val granted = ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) ==
             PackageManager.PERMISSION_GRANTED
-        if (granted) return
-        val prefs = getSharedPreferences(PREFS, MODE_PRIVATE)
-        if (prefs.getBoolean(KEY_NOTIFICATIONS_ASKED, false)) return
-        prefs.edit().putBoolean(KEY_NOTIFICATIONS_ASKED, true).apply()
-        notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
+        if (!granted) notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
+    }
+
+    /** Asks again each time a session starts while the permission is still missing. */
+    private fun observeNotificationPermission() {
+        lifecycleScope.launch {
+            repeatOnLifecycle(Lifecycle.State.RESUMED) {
+                AppGraph.engine.state
+                    .map { it.isActive }
+                    .distinctUntilChanged()
+                    // The value already present when the activity resumes is not a start: only
+                    // a rising edge seen while resumed counts. Otherwise coming back from the
+                    // permission dialog itself (which pauses the activity) would ask straight away.
+                    .drop(1)
+                    .filter { it }
+                    .collect { requestNotificationPermissionIfMissing() }
+            }
+        }
     }
 
     /** FLAG_KEEP_SCREEN_ON follows "session active AND Settings.keepScreenOn" while the activity is started. */

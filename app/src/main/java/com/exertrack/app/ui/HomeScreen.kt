@@ -1,5 +1,6 @@
 package com.exertrack.app.ui
 
+import android.provider.DocumentsContract
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
@@ -44,6 +45,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -89,9 +91,11 @@ fun HomeScreen(
         )
     }
 
-    var renameTarget by remember { mutableStateOf<Workout?>(null) }
+    // Ids rather than Workout objects: the activity can be recreated (rotation, background kill)
+    // while the rename dialog or the Save-as picker is up, and only saveable state survives that.
+    var renameTargetId by rememberSaveable { mutableStateOf<String?>(null) }
     var deleteTarget by remember { mutableStateOf<Workout?>(null) }
-    var exportTarget by remember { mutableStateOf<Workout?>(null) }
+    var exportTargetId by rememberSaveable { mutableStateOf<String?>(null) }
 
     fun notify(message: String) {
         scope.launch { snackbar.showSnackbar(message) }
@@ -100,20 +104,27 @@ fun HomeScreen(
     val exportLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.CreateDocument(Exporters.MIME_CSV)
     ) { uri ->
-        val target = exportTarget
-        exportTarget = null
-        if (uri != null && target != null) {
-            scope.launch {
-                val result = withContext(Dispatchers.IO) {
-                    runCatching { Files.writeTo(context, uri, Exporters.workoutCsv(target)) }
+        val target = exportTargetId?.let(repository::workout)
+        exportTargetId = null
+        if (uri == null) return@rememberLauncherForActivityResult
+        scope.launch {
+            if (target == null) {
+                // The picker has already created the document; do not leave an empty file behind.
+                withContext(Dispatchers.IO) {
+                    runCatching { DocumentsContract.deleteDocument(context.contentResolver, uri) }
                 }
-                snackbar.showSnackbar(
-                    result.fold(
-                        onSuccess = { "Exported ${target.name} as CSV" },
-                        onFailure = { "Export failed: ${it.message ?: "could not write the file"}" },
-                    )
-                )
+                snackbar.showSnackbar("Export failed: the workout could not be found")
+                return@launch
             }
+            val result = withContext(Dispatchers.IO) {
+                runCatching { Files.writeTo(context, uri, Exporters.workoutCsv(target)) }
+            }
+            snackbar.showSnackbar(
+                result.fold(
+                    onSuccess = { "Exported ${target.name} as CSV" },
+                    onFailure = { "Export failed: ${it.message ?: "could not write the file"}" },
+                )
+            )
         }
     }
 
@@ -170,9 +181,9 @@ fun HomeScreen(
                             val copy = repository.duplicateWorkout(workout.id)
                             if (copy != null) notify("Created ${copy.name}")
                         },
-                        onRename = { renameTarget = workout },
+                        onRename = { renameTargetId = workout.id },
                         onExport = {
-                            exportTarget = workout
+                            exportTargetId = workout.id
                             exportLauncher.launch(Format.fileStem(workout.name) + ".csv")
                         },
                         onDelete = {
@@ -189,14 +200,14 @@ fun HomeScreen(
         }
     }
 
-    renameTarget?.let { workout ->
+    renameTargetId?.let { id -> workouts.firstOrNull { it.id == id } }?.let { workout ->
         RenameDialog(
             workout = workout,
             onConfirm = { newName ->
-                renameTarget = null
+                renameTargetId = null
                 repository.renameWorkout(workout.id, newName)
             },
-            onDismiss = { renameTarget = null },
+            onDismiss = { renameTargetId = null },
         )
     }
 
@@ -312,7 +323,7 @@ private fun RenameDialog(
     onConfirm: (String) -> Unit,
     onDismiss: () -> Unit,
 ) {
-    var value by remember(workout.id) {
+    var value by rememberSaveable(workout.id, stateSaver = TextFieldValue.Saver) {
         mutableStateOf(TextFieldValue(workout.name, selection = TextRange(0, workout.name.length)))
     }
     val focusRequester = remember { FocusRequester() }

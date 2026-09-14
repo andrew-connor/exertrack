@@ -34,7 +34,7 @@ sealed class Screen {
     data object Home : Screen()
     data class Editor(val workoutId: String) : Screen()
     data class Active(val workoutId: String) : Screen()
-    /** [uri] null = show the picker; [replaceWorkoutId] preselects "Replace rows of" that workout for the first sheet. */
+    /** [uri] null = show the picker; [replaceWorkoutId] preselects "Replace rows of" that workout for its source sheet (the first sheet when unknown). */
     data class Import(val uri: Uri?, val replaceWorkoutId: String? = null) : Screen()
     data object Log : Screen()
     data object Settings : Screen()
@@ -61,10 +61,6 @@ fun AppRoot(pendingImport: Uri?, onImportConsumed: () -> Unit) {
         if (stack.size <= 1) return
         stateHolder.removeState(keyFor(stack.lastIndex))
         stack.removeAt(stack.lastIndex)
-    }
-
-    fun popToHome() {
-        while (stack.size > 1) pop()
     }
 
     /** Push, or swap the top entry when it is already a screen of the same kind (a second shared file). */
@@ -126,7 +122,7 @@ fun AppRoot(pendingImport: Uri?, onImportConsumed: () -> Unit) {
                     is Screen.Import -> ImportScreen(
                         initialUri = top.uri,
                         replaceWorkoutId = top.replaceWorkoutId,
-                        onDone = { popToHome() },
+                        onDone = { pop() },
                     )
                     is Screen.Active -> ActiveWorkoutScreen(
                         workoutId = top.workoutId,
