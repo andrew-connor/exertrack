@@ -163,7 +163,6 @@ class WorkoutEngine(
         phaseElapsedBeforeSegment += now - segmentStartedAt
         paused = true
         pauseStartedAt = now
-        stopTicker()
         cues.stopSpeaking()
         updateLog()
         writeSnapshot(force = true)
@@ -257,6 +256,7 @@ class WorkoutEngine(
         cues.prepare()
         updateLog()
         writeSnapshot(force = true)
+        ensureTicker()
         publish()
     }
 
@@ -278,12 +278,16 @@ class WorkoutEngine(
         if (!isActive) { resetInternals(); publish() }
     }
 
-    /** Advance clocks. Called by the internal ticker; public so tests can drive it. */
+    /**
+     * Advance clocks and republish. Called by the internal ticker ten times a second whenever a
+     * session is active (also while paused or counting up, so elapsed times stay live); public so
+     * tests can drive it.
+     */
     fun tick() {
-        if (!running) return
+        if (!isActive) return
         val now = clock.elapsedRealtime()
         val duration = phaseDurationMs
-        if (duration != null) {
+        if (running && duration != null) {
             val remaining = duration - phaseElapsedMs(now)
             if (remaining <= 0) {
                 onCountdownEnded()
@@ -296,7 +300,7 @@ class WorkoutEngine(
             }
             lastTickSecond = sec
         }
-        writeSnapshot(force = false)
+        if (running) writeSnapshot(force = false)
         publish()
     }
 
@@ -501,8 +505,7 @@ class WorkoutEngine(
     }
 
     private fun ensureTicker() {
-        val shouldRun = running && phaseDurationMs != null
-        if (!shouldRun) { stopTicker(); return }
+        if (!isActive) { stopTicker(); return }
         if (tickerJob?.isActive == true) return
         tickerJob = scope.launch {
             while (isActive) {
