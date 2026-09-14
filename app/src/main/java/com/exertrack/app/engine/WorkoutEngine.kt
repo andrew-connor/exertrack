@@ -34,6 +34,8 @@ class WorkoutEngine(
         const val SNAPSHOT_EVERY_MS = 5_000L
         /** A held countdown starts anyway if the speech engine never reports the announcement done. */
         const val ANNOUNCE_TIMEOUT_MS = 8_000L
+        /** A rest longer than this announces the exercise again when it ends. */
+        const val REANNOUNCE_AFTER_REST_SEC = 15
     }
 
     private val _state = MutableStateFlow(SessionState())
@@ -421,8 +423,12 @@ class WorkoutEngine(
         when (phase) {
             Phase.LEAD_IN -> enterExercise(stepIndex, announce = false, auto = true)
             Phase.EXERCISE -> completeStep(auto = true)
-            // The rest announcement already named the exercise, so it starts on the GO chime alone.
-            Phase.REST -> enterExercise(stepIndex, announce = false, auto = true)
+            // A short rest's opening announcement is recent enough; after a long rest the exercise
+            // is announced again (clock held) before the GO chime.
+            Phase.REST -> {
+                val longRest = (phaseDurationMs ?: 0L) > REANNOUNCE_AFTER_REST_SEC * 1000L
+                enterExercise(stepIndex, announce = longRest, auto = true)
+            }
             else -> {}
         }
     }

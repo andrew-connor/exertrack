@@ -59,9 +59,9 @@ Speech (only when `Settings.speechEnabled`):
   or "until done" for untimed rows), interrupting anything queued.
 - WAITING start: `"Next: {name}, {duration}. Tap when ready."`
 - REST start: `"Rest, {n} seconds. Next: {name}, {duration}."`
-- EXERCISE start reached without a lead-in and without a preceding REST (Skip out of a rest,
-  a zero lead-in): `"{name}, {duration}"`. An exercise reached from a REST is not announced
-  again; the rest announcement already named it.
+- EXERCISE start reached without a lead-in (Skip out of a rest, a zero lead-in, or the end of a
+  rest longer than 15 s): `"{name}, {duration}"`. After a rest of 15 s or less the exercise is not
+  announced again; the rest announcement was recent enough.
 - FINISHED: `"Workout complete"`. Nothing is spoken on pause, resume, skip or back.
 
 Announcement hold: a countdown never starts while its announcement is playing. LEAD_IN, REST and

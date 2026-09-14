@@ -197,6 +197,37 @@ class WorkoutEngineTest {
     }
 
     @Test
+    fun `a rest longer than 15 seconds announces the exercise again when it ends`() = runTest {
+        val rows = listOf(
+            ExerciseRow(id = "a", name = "Row", durationSec = 10, triggerSec = 20),
+            ExerciseRow(id = "b", name = "Squats", durationSec = 30, triggerSec = null),
+        )
+        val h = Harness(this)
+        h.cues.autoComplete = false
+        h.engine.load(workout(leadIn = 0, rows = rows))
+        h.engine.primaryTap()
+        h.cues.finishSpeech() // "Row, 10 seconds"
+        advance(10_000) // -> REST 20 s, announced
+        assertEquals(Phase.REST, h.state.phase)
+        assertEquals("Rest, 20 seconds. Next: Squats, 30 seconds.", h.cues.spoken.last())
+        h.cues.finishSpeech()
+        h.cues.chimes.clear()
+        advance(20_000) // rest over: the exercise is announced again and its clock waits
+        assertEquals(Phase.EXERCISE, h.state.phase)
+        assertTrue(h.state.announcing)
+        assertEquals("Squats, 30 seconds", h.cues.spoken.last())
+        // only the rest's 3-2-1 warning ticks so far; the GO chime waits for the announcement
+        assertFalse(h.cues.chimes.contains(ChimeKind.GO))
+        advance(1_000)
+        assertEquals(30_000L, h.state.remainingMs)
+        h.cues.finishSpeech()
+        assertEquals(ChimeKind.GO, h.cues.chimes.last())
+        advance(1_000)
+        assertEquals(29_000L, h.state.remainingMs)
+        h.engine.stopForTest()
+    }
+
+    @Test
     fun `a tap during the announcement starts the clock right away`() = runTest {
         val h = Harness(this)
         h.cues.autoComplete = false
