@@ -32,9 +32,18 @@ class WorkoutEngineTest {
         val spoken = mutableListOf<String>()
         var prepared = 0
         var stops = 0
+        /** When false, an utterance only completes when [finishSpeech] is called (or speech is stopped). */
+        var autoComplete = true
+        private val pendingDone = ArrayDeque<() -> Unit>()
         override fun chime(kind: ChimeKind) { chimes += kind }
-        override fun speak(text: String, interrupt: Boolean) { spoken += text }
-        override fun stopSpeaking() { stops++ }
+        override fun speak(text: String, interrupt: Boolean, onDone: (() -> Unit)?) {
+            spoken += text
+            if (onDone == null) return
+            if (autoComplete) onDone() else pendingDone.addLast(onDone)
+        }
+        /** Complete every utterance still "playing", like the real speaker does at the end of speech or on stop. */
+        fun finishSpeech() { while (pendingDone.isNotEmpty()) pendingDone.removeFirst().invoke() }
+        override fun stopSpeaking() { stops++; finishSpeech() }
         override fun prepare() { prepared++ }
     }
 
@@ -126,12 +135,113 @@ class WorkoutEngineTest {
         assertEquals(1, h.store.log.values.first().completedSteps)
 
         h.cues.chimes.clear()
+        val spokenBefore = h.cues.spoken.size
         advance(15_000)
         assertEquals(Phase.EXERCISE, h.state.phase)
         assertEquals(1, h.state.stepIndex)
         assertNull(h.state.remainingMs) // untimed
         assertEquals(ChimeKind.GO, h.cues.chimes.last())
-        assertEquals("Plank, until done", h.cues.spoken.last())
+        // the rest announcement already named the exercise, so nothing more is said at go
+        assertEquals(spokenBefore, h.cues.spoken.size)
+        h.engine.stopForTest()
+    }
+
+    @Test
+    fun `a countdown waits for its announcement before it starts`() = runTest {
+        val h = Harness(this)
+        h.cues.autoComplete = false
+        h.engine.load(workout())
+        h.engine.primaryTap()
+        assertEquals(Phase.LEAD_IN, h.state.phase)
+        assertTrue(h.state.announcing)
+        assertEquals(listOf("Push-ups, 40 seconds"), h.cues.spoken)
+
+        advance(2_000)
+        assertEquals(3000L, h.state.remainingMs) // held at its full value while speaking
+        assertTrue(h.cues.chimes.isEmpty())
+
+        h.cues.finishSpeech()
+        assertFalse(h.state.announcing)
+        advance(3_000)
+        assertEquals(Phase.EXERCISE, h.state.phase)
+        assertEquals(listOf(ChimeKind.TICK, ChimeKind.TICK, ChimeKind.TICK, ChimeKind.GO), h.cues.chimes)
+        h.engine.stopForTest()
+    }
+
+    @Test
+    fun `an announced exercise plays its go chime only after the announcement`() = runTest {
+        val h = Harness(this)
+        h.cues.autoComplete = false
+        h.engine.load(workout(leadIn = 0))
+        h.engine.primaryTap() // no lead-in: the exercise itself is announced first
+        assertEquals(Phase.EXERCISE, h.state.phase)
+        assertTrue(h.state.announcing)
+        assertTrue(h.cues.chimes.isEmpty())
+        advance(1_500)
+        assertEquals(40_000L, h.state.remainingMs)
+
+        h.cues.finishSpeech()
+        assertEquals(listOf(ChimeKind.GO), h.cues.chimes)
+        assertFalse(h.state.announcing)
+        advance(40_000)
+        assertEquals(Phase.REST, h.state.phase)
+        assertTrue(h.state.announcing) // the rest waits for its own announcement
+        assertEquals(15_000L, h.state.remainingMs)
+        advance(4_000)
+        assertEquals(15_000L, h.state.remainingMs)
+        h.cues.finishSpeech()
+        advance(15_000)
+        assertEquals(Phase.EXERCISE, h.state.phase)
+        assertEquals(1, h.state.stepIndex)
+        h.engine.stopForTest()
+    }
+
+    @Test
+    fun `a tap during the announcement starts the clock right away`() = runTest {
+        val h = Harness(this)
+        h.cues.autoComplete = false
+        h.engine.load(workout(leadIn = 0))
+        h.engine.primaryTap()
+        assertTrue(h.state.announcing)
+        advance(1_000) // past the post-transition debounce
+        h.engine.primaryTap()
+        assertFalse(h.state.announcing)
+        assertEquals(listOf(ChimeKind.GO), h.cues.chimes)
+        assertEquals(1, h.cues.stops)
+        advance(1_000)
+        assertEquals(39_000L, h.state.remainingMs)
+        h.engine.stopForTest()
+    }
+
+    @Test
+    fun `a hold releases on its own if the speech engine never reports back`() = runTest {
+        val h = Harness(this)
+        h.cues.autoComplete = false
+        h.engine.load(workout())
+        h.engine.primaryTap()
+        advance(WorkoutEngine.ANNOUNCE_TIMEOUT_MS + 100)
+        assertFalse(h.state.announcing)
+        advance(2_900)
+        assertEquals(Phase.EXERCISE, h.state.phase)
+        h.engine.stopForTest()
+    }
+
+    @Test
+    fun `pausing during the announcement keeps the go chime for the resume`() = runTest {
+        val h = Harness(this)
+        h.cues.autoComplete = false
+        h.engine.load(workout(leadIn = 0))
+        h.engine.primaryTap()
+        h.engine.pause()
+        assertTrue(h.state.paused)
+        assertFalse(h.state.announcing)
+        assertTrue(h.cues.chimes.isEmpty())
+        advance(3_000)
+        assertEquals(40_000L, h.state.remainingMs)
+        h.engine.resume()
+        assertEquals(listOf(ChimeKind.GO), h.cues.chimes)
+        advance(1_000)
+        assertEquals(39_000L, h.state.remainingMs)
         h.engine.stopForTest()
     }
 

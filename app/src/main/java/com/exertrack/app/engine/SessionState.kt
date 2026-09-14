@@ -23,6 +23,8 @@ data class SessionState(
     val sessionId: String? = null,
     val phase: Phase = Phase.IDLE,
     val paused: Boolean = false,
+    /** True while a spoken announcement plays and the phase's clock is held at its full value. */
+    val announcing: Boolean = false,
     /** Step that is running (EXERCISE) or about to run (LEAD_IN / REST / WAITING). */
     val stepIndex: Int = 0,
     /** Milliseconds left in the current countdown (LEAD_IN, timed EXERCISE, REST); null otherwise. Frozen while paused. */

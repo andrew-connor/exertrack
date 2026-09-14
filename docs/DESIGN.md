@@ -59,8 +59,17 @@ Speech (only when `Settings.speechEnabled`):
   or "until done" for untimed rows), interrupting anything queued.
 - WAITING start: `"Next: {name}, {duration}. Tap when ready."`
 - REST start: `"Rest, {n} seconds. Next: {name}, {duration}."`
-- EXERCISE start reached from REST (no lead-in): `"{name}, {duration}"`.
+- EXERCISE start reached without a lead-in and without a preceding REST (Skip out of a rest,
+  a zero lead-in): `"{name}, {duration}"`. An exercise reached from a REST is not announced
+  again; the rest announcement already named it.
 - FINISHED: `"Workout complete"`. Nothing is spoken on pause, resume, skip or back.
+
+Announcement hold: a countdown never starts while its announcement is playing. LEAD_IN, REST and
+an announced EXERCISE are entered with the clock held at its full value (`SessionState.announcing`)
+until the speech engine reports the utterance done; the GO chime of a held exercise plays at that
+moment. A tap during the hold stops the announcement and starts the clock; pausing during the hold
+keeps the pending GO chime for the resume; a hold releases by itself after 8 s if the engine never
+reports back. With speech disabled or muted nothing is held.
 
 Input hygiene: a primary tap arriving within 600 ms after an *automatic* phase change (a clock
 reaching zero) is ignored, so a pause tap does not become an advance when the state flips under

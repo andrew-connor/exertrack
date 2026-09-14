@@ -93,9 +93,13 @@ class AudioCues(
         vibrate(kind)
     }
 
-    override fun speak(text: String, interrupt: Boolean) {
-        if (settings.value.chimesMuted || text.isBlank()) return
-        say(text, interrupt)
+    override fun speak(text: String, interrupt: Boolean, onDone: (() -> Unit)?) {
+        if (settings.value.chimesMuted || text.isBlank()) {
+            // Nothing will be spoken, so whatever waits on the announcement can proceed now.
+            onDone?.invoke()
+            return
+        }
+        say(text, interrupt, onDone)
     }
 
     override fun stopSpeaking() {
@@ -213,12 +217,12 @@ class AudioCues(
 
     // ---- speech ----
 
-    private fun say(text: String, interrupt: Boolean) {
+    private fun say(text: String, interrupt: Boolean, onDone: (() -> Unit)? = null) {
         // Take focus now so other audio ducks before the first word; the release timer is armed
         // in case the engine never reports a start (for example when it failed to initialise).
         holdFocus()
         scheduleFocusRelease()
-        speaker.speak(text, interrupt)
+        speaker.speak(text, interrupt, onDone)
     }
 
     // ---- vibration ----

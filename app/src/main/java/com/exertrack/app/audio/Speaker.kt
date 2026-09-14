@@ -18,6 +18,10 @@ import java.util.Locale
  * still downloading) does not silence speech for the rest of the process. Uses USAGE_MEDIA
  * audio attributes so speech follows the chimes to earbuds. [onSpeechStart] / [onSpeechDone]
  * let AudioCues hold audio focus while speaking.
+ *
+ * Every utterance's completion callback fires exactly once on the main thread, whether the
+ * utterance finished, failed, was flushed by a later interrupting utterance, was stopped, or
+ * could never be spoken. The workout engine relies on that to release a held countdown.
  */
 class Speaker(
     private val context: Context,
@@ -34,11 +38,15 @@ class Speaker(
 
     private enum class EngineState { NONE, INITIALIZING, READY, FAILED }
 
+    private class Request(val text: String, val interrupt: Boolean, val onDone: (() -> Unit)?)
+
     private val mainHandler = Handler(Looper.getMainLooper())
     private var tts: TextToSpeech? = null
     private var engineState = EngineState.NONE
-    /** Utterances requested while the engine is still starting: text to interrupt flag. */
-    private val pending = ArrayDeque<Pair<String, Boolean>>()
+    /** Utterances requested while the engine is still starting. */
+    private val pending = ArrayDeque<Request>()
+    /** Completion callbacks of utterances handed to the engine, by utterance id. */
+    private val completions = HashMap<String, () -> Unit>()
     private var utteranceCounter = 0L
     private var warmUpRequested = false
     /** elapsedRealtime of the last failure; gates cooldown retries from [speak]. */
@@ -52,21 +60,21 @@ class Speaker(
         }
 
         override fun onDone(utteranceId: String?) {
-            if (isTracked(utteranceId)) mainHandler.post { onSpeechDone() }
+            if (isTracked(utteranceId)) mainHandler.post { complete(utteranceId!!) }
         }
 
         @Deprecated("Deprecated in Java")
         override fun onError(utteranceId: String?) {
-            if (isTracked(utteranceId)) mainHandler.post { onSpeechDone() }
+            if (isTracked(utteranceId)) mainHandler.post { complete(utteranceId!!) }
         }
 
         override fun onError(utteranceId: String?, errorCode: Int) {
             Log.w(TAG, "Utterance $utteranceId failed with code $errorCode")
-            if (isTracked(utteranceId)) mainHandler.post { onSpeechDone() }
+            if (isTracked(utteranceId)) mainHandler.post { complete(utteranceId!!) }
         }
 
         override fun onStop(utteranceId: String?, interrupted: Boolean) {
-            if (isTracked(utteranceId)) mainHandler.post { onSpeechDone() }
+            if (isTracked(utteranceId)) mainHandler.post { complete(utteranceId!!) }
         }
 
         /** Real utterances only; the warm-up utterance must not touch audio focus. */
@@ -85,31 +93,36 @@ class Speaker(
         if (engineState == EngineState.READY) warmUp()
     }
 
-    fun speak(text: String, interrupt: Boolean) {
-        if (text.isBlank()) return
+    fun speak(text: String, interrupt: Boolean, onDone: (() -> Unit)? = null) {
+        if (text.isBlank()) {
+            onDone?.invoke()
+            return
+        }
         ensureEngine()
         when (engineState) {
-            EngineState.FAILED, EngineState.NONE -> return
-            EngineState.READY -> speakNow(text, interrupt)
+            EngineState.FAILED, EngineState.NONE -> onDone?.invoke()
+            EngineState.READY -> speakNow(Request(text, interrupt, onDone))
             EngineState.INITIALIZING -> {
-                if (interrupt) pending.clear()
-                pending.addLast(text to interrupt)
+                if (interrupt) dropPending()
+                pending.addLast(Request(text, interrupt, onDone))
             }
         }
     }
 
     fun stop() {
-        pending.clear()
-        if (engineState != EngineState.READY) return
-        try {
-            tts?.stop()
-        } catch (e: Exception) {
-            Log.w(TAG, "Could not stop speech", e)
+        dropPending()
+        if (engineState == EngineState.READY) {
+            try {
+                tts?.stop()
+            } catch (e: Exception) {
+                Log.w(TAG, "Could not stop speech", e)
+            }
         }
+        completeAll()
     }
 
     fun shutdown() {
-        pending.clear()
+        dropPending()
         warmUpRequested = false
         val engine = tts
         tts = null
@@ -123,6 +136,7 @@ class Speaker(
                 Log.w(TAG, "Could not shut the speech engine down", e)
             }
         }
+        completeAll()
     }
 
     // ---- internals ----
@@ -199,7 +213,7 @@ class Speaker(
     private fun fail() {
         engineState = EngineState.FAILED
         failedAt = SystemClock.elapsedRealtime()
-        pending.clear()
+        dropPending()
         val engine = tts
         tts = null
         if (engine != null) {
@@ -209,6 +223,7 @@ class Speaker(
                 Log.w(TAG, "Could not shut the failed speech engine down", e)
             }
         }
+        completeAll()
     }
 
     private fun warmUp() {
@@ -223,21 +238,52 @@ class Speaker(
 
     private fun flushPending() {
         while (pending.isNotEmpty()) {
-            val (text, interrupt) = pending.removeFirst()
-            speakNow(text, interrupt)
+            speakNow(pending.removeFirst())
         }
     }
 
-    private fun speakNow(text: String, interrupt: Boolean) {
-        val engine = tts ?: return
+    /** Queued-but-never-spoken utterances still owe their completion callbacks. */
+    private fun dropPending() {
+        while (pending.isNotEmpty()) {
+            pending.removeFirst().onDone?.invoke()
+        }
+    }
+
+    /** Complete every utterance the engine still holds (stop, flush, failure, shutdown). */
+    private fun completeAll() {
+        if (completions.isEmpty()) return
+        val callbacks = completions.values.toList()
+        completions.clear()
+        callbacks.forEach { it() }
+    }
+
+    private fun complete(utteranceId: String) {
+        onSpeechDone()
+        completions.remove(utteranceId)?.invoke()
+    }
+
+    private fun speakNow(request: Request) {
+        val engine = tts
+        if (engine == null) {
+            request.onDone?.invoke()
+            return
+        }
+        // A flushing utterance ends whatever was queued or playing; settle those callbacks now
+        // rather than trusting every engine to report onStop for flushed items.
+        if (request.interrupt) completeAll()
         val id = UTTERANCE_PREFIX + (++utteranceCounter)
-        val mode = if (interrupt) TextToSpeech.QUEUE_FLUSH else TextToSpeech.QUEUE_ADD
+        val mode = if (request.interrupt) TextToSpeech.QUEUE_FLUSH else TextToSpeech.QUEUE_ADD
         val result = try {
-            engine.speak(text, mode, null, id)
+            engine.speak(request.text, mode, null, id)
         } catch (e: Exception) {
             Log.w(TAG, "Could not speak", e)
             TextToSpeech.ERROR
         }
-        if (result != TextToSpeech.SUCCESS) Log.w(TAG, "Speech request rejected with $result")
+        if (result == TextToSpeech.SUCCESS) {
+            request.onDone?.let { completions[id] = it }
+        } else {
+            Log.w(TAG, "Speech request rejected with $result")
+            request.onDone?.invoke()
+        }
     }
 }

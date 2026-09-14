@@ -69,6 +69,7 @@ class WorkoutService : Service() {
     private data class NotificationKey(
         val phase: Phase,
         val paused: Boolean,
+        val announcing: Boolean,
         val stepIndex: Int,
         val pausedRemainingSec: Int,
         val rowName: String?,
@@ -190,6 +191,7 @@ class WorkoutService : Service() {
     private fun keyOf(state: SessionState): NotificationKey = NotificationKey(
         phase = state.phase,
         paused = state.paused,
+        announcing = state.announcing,
         stepIndex = state.stepIndex,
         pausedRemainingSec = if (state.paused) state.remainingSec else -1,
         rowName = state.currentRow?.name,
@@ -264,10 +266,17 @@ class WorkoutService : Service() {
         }
         val remaining = state.remainingMs
         val paused = state.paused && state.isActive
+        // While the announcement plays the clock is held at its full value, so no chronometer.
+        val announcing = state.announcing && state.isActive && !paused
         val parts = mutableListOf(Format.counter(state))
         Format.roundLabel(state)?.let { parts += it }
-        parts += if (paused) "Paused" else phaseWord(state)
+        parts += when {
+            paused -> "Paused"
+            announcing -> "Get ready"
+            else -> phaseWord(state)
+        }
         if (paused && remaining != null) parts += "${Format.countdown(remaining)} left"
+        if (announcing && remaining != null) parts += Format.countdown(remaining)
         val text = parts.joinToString(" · ")
 
         val builder = NotificationCompat.Builder(this, CHANNEL_ID)
@@ -285,7 +294,7 @@ class WorkoutService : Service() {
 
         val now = System.currentTimeMillis()
         when {
-            paused -> builder.setUsesChronometer(false).setShowWhen(false)
+            paused || announcing -> builder.setUsesChronometer(false).setShowWhen(false)
             remaining != null -> builder
                 .setUsesChronometer(true)
                 .setChronometerCountDown(true)
@@ -316,6 +325,7 @@ class WorkoutService : Service() {
 
     private fun primaryLabel(state: SessionState): String = when {
         state.phase == Phase.WAITING -> "Start next"
+        state.announcing && !state.paused -> "Start now"
         state.isUntimedExercise -> "Done"
         state.paused -> "Resume"
         else -> "Pause"

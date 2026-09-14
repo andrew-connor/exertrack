@@ -24,10 +24,17 @@ import com.exertrack.app.io.XlsxReader
  * sheet is mapped to, and how the mappings are applied to the repository in one pass.
  */
 
-/** ACTION_OPEN_DOCUMENT with the persistable-permission flag so re-import from source keeps working. */
+/**
+ * ACTION_OPEN_DOCUMENT with the persistable-permission flag so re-import from source keeps
+ * working, and without CATEGORY_OPENABLE so the picker also lists native Google Sheets: those
+ * are virtual documents that Files.readBytes converts when the provider offers a spreadsheet
+ * stream, and explains otherwise.
+ */
 internal object PersistableOpenDocument : ActivityResultContracts.OpenDocument() {
     override fun createIntent(context: Context, input: Array<String>): Intent =
-        super.createIntent(context, input).addFlags(Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
+        super.createIntent(context, input)
+            .addFlags(Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
+            .apply { removeCategory(Intent.CATEGORY_OPENABLE) }
 }
 
 /** Keep read access to [uri] across restarts. Fails quietly for providers that do not offer it. */

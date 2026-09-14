@@ -486,7 +486,8 @@ private fun SessionHeader(
 private fun phaseLabel(state: SessionState): String = when (state.phase) {
     Phase.IDLE -> "READY"
     Phase.LEAD_IN -> "GET READY"
-    Phase.EXERCISE -> if (state.isUntimedExercise) "UNTIL DONE" else "GO"
+    // The exercise is being announced: the GO chime and the clock follow the announcement.
+    Phase.EXERCISE -> if (state.announcing) "GET READY" else if (state.isUntimedExercise) "UNTIL DONE" else "GO"
     Phase.REST -> "REST"
     Phase.WAITING -> "TAP WHEN READY"
     Phase.FINISHED -> "DONE"
@@ -494,6 +495,7 @@ private fun phaseLabel(state: SessionState): String = when (state.phase) {
 
 private fun phaseColor(state: SessionState): Color = when {
     state.paused && state.isActive -> ExColors.paused
+    state.phase == Phase.EXERCISE && state.announcing -> ExColors.waiting
     state.phase == Phase.EXERCISE -> ExColors.go
     state.phase == Phase.REST -> ExColors.rest
     state.phase == Phase.LEAD_IN || state.phase == Phase.WAITING -> ExColors.waiting
@@ -716,10 +718,15 @@ private fun ControlBar(
 
 private fun primaryLabel(state: SessionState): String = when (state.phase) {
     Phase.IDLE -> "START"
-    Phase.LEAD_IN, Phase.REST -> if (state.paused) "RESUME" else "PAUSE"
-    Phase.EXERCISE -> when {
-        state.isUntimedExercise -> "DONE"
+    Phase.LEAD_IN, Phase.REST -> when {
         state.paused -> "RESUME"
+        state.announcing -> "START NOW"
+        else -> "PAUSE"
+    }
+    Phase.EXERCISE -> when {
+        state.paused -> "RESUME"
+        state.announcing -> "START NOW"
+        state.isUntimedExercise -> "DONE"
         else -> "PAUSE"
     }
     Phase.WAITING -> "START NEXT"

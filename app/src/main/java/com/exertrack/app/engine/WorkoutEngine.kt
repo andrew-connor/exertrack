@@ -32,6 +32,8 @@ class WorkoutEngine(
         const val TICK_MS = 100L
         const val DEBOUNCE_MS = 600L
         const val SNAPSHOT_EVERY_MS = 5_000L
+        /** A held countdown starts anyway if the speech engine never reports the announcement done. */
+        const val ANNOUNCE_TIMEOUT_MS = 8_000L
     }
 
     private val _state = MutableStateFlow(SessionState())
@@ -58,11 +60,18 @@ class WorkoutEngine(
     private var finishedEntry: LogEntry? = null
     private var tickerJob: Job? = null
 
+    // ---- announcement hold: a countdown waits for its spoken announcement to finish ----
+    private var holding = false
+    private var holdToken = 0
+    private var holdStartedAt = 0L
+    /** The GO chime that marks the start of a held exercise, played when the hold is released. */
+    private var pendingGoChime = false
+
     private val rows: List<ExerciseRow> get() = workout?.rows ?: emptyList()
     private val totalSteps: Int get() = rows.size * (workout?.rounds ?: 1)
     private fun rowAt(step: Int): ExerciseRow? = if (rows.isEmpty()) null else rows[step % rows.size]
     private val isActive: Boolean get() = phase != Phase.IDLE && phase != Phase.FINISHED
-    private val running: Boolean get() = isActive && !paused
+    private val running: Boolean get() = isActive && !paused && !holding
 
     // ---- public API ----
 
@@ -129,6 +138,12 @@ class WorkoutEngine(
     fun primaryTap() {
         val now = clock.elapsedRealtime()
         if (now - lastAutoTransitionAt < DEBOUNCE_MS) return
+        if (holding) {
+            // Tapping during the announcement skips the rest of it and starts the clock now.
+            cues.stopSpeaking()
+            releaseHold(holdToken)
+            return
+        }
         when (phase) {
             Phase.IDLE -> startSession(0)
             Phase.LEAD_IN, Phase.REST -> togglePause()
@@ -167,7 +182,12 @@ class WorkoutEngine(
     fun pause() {
         if (!isActive || paused || phaseDurationMs == null) return
         val now = clock.elapsedRealtime()
-        phaseElapsedBeforeSegment += now - segmentStartedAt
+        if (holding) {
+            // The clock never started; keep the pending GO chime for the resume.
+            cancelHold()
+        } else {
+            phaseElapsedBeforeSegment += now - segmentStartedAt
+        }
         paused = true
         pauseStartedAt = now
         cues.stopSpeaking()
@@ -186,6 +206,10 @@ class WorkoutEngine(
         // Do not replay the warning tick for the second already on screen; a fresh countdown
         // (setPhase) still starts from -1.
         lastTickSecond = phaseDurationMs?.let { ((it - phaseElapsedBeforeSegment + 999) / 1000).toInt() } ?: -1
+        if (pendingGoChime) {
+            pendingGoChime = false
+            cues.chime(ChimeKind.GO)
+        }
         ensureTicker()
         writeSnapshot(force = true)
         publish()
@@ -296,6 +320,11 @@ class WorkoutEngine(
     fun tick() {
         if (!isActive) return
         val now = clock.elapsedRealtime()
+        if (holding && now - holdStartedAt >= ANNOUNCE_TIMEOUT_MS) {
+            cues.stopSpeaking()
+            releaseHold(holdToken)
+            return
+        }
         val duration = phaseDurationMs
         if (running && duration != null) {
             val remaining = duration - phaseElapsedMs(now)
@@ -343,22 +372,26 @@ class WorkoutEngine(
         val leadMs = w.leadInSec.takeIf { it > 0 }?.let { it * 1000L }
         if (leadMs == null) { enterExercise(step, announce = true, auto = false); return }
         setPhase(Phase.LEAD_IN, step, leadMs)
-        rowAt(step)?.let { speakIfEnabled("${it.name}, ${spokenDuration(it)}", interrupt = true) }
+        rowAt(step)?.let { announce("${it.name}, ${spokenDuration(it)}", goChimeOnRelease = false) }
         afterTransition()
     }
 
     private fun enterExercise(step: Int, announce: Boolean, auto: Boolean) {
         val row = rowAt(step) ?: return
         setPhase(Phase.EXERCISE, step, row.durationSec?.takeIf { it > 0 }?.let { it * 1000L })
-        cues.chime(ChimeKind.GO)
-        if (announce) speakIfEnabled("${row.name}, ${spokenDuration(row)}", interrupt = true)
+        if (announce && settings().speechEnabled) {
+            // Announce first; the GO chime and the clock follow once the announcement is done.
+            announce("${row.name}, ${spokenDuration(row)}", goChimeOnRelease = true)
+        } else {
+            cues.chime(ChimeKind.GO)
+        }
         if (auto) lastAutoTransitionAt = clock.elapsedRealtime()
         afterTransition()
     }
 
     private fun enterRest(step: Int, restSec: Int) {
         setPhase(Phase.REST, step, restSec * 1000L)
-        rowAt(step)?.let { speakIfEnabled("Rest, ${spokenSeconds(restSec)}. Next: ${it.name}, ${spokenDuration(it)}.", interrupt = true) }
+        rowAt(step)?.let { announce("Rest, ${spokenSeconds(restSec)}. Next: ${it.name}, ${spokenDuration(it)}.", goChimeOnRelease = false) }
         afterTransition()
     }
 
@@ -388,13 +421,16 @@ class WorkoutEngine(
         when (phase) {
             Phase.LEAD_IN -> enterExercise(stepIndex, announce = false, auto = true)
             Phase.EXERCISE -> completeStep(auto = true)
-            Phase.REST -> enterExercise(stepIndex, announce = true, auto = true)
+            // The rest announcement already named the exercise, so it starts on the GO chime alone.
+            Phase.REST -> enterExercise(stepIndex, announce = false, auto = true)
             else -> {}
         }
     }
 
     private fun finish(status: SessionStatus) {
         val now = clock.elapsedRealtime()
+        cancelHold()
+        pendingGoChime = false
         if (paused) {
             pausedMsAccum += now - (pauseStartedAt ?: now)
             pauseStartedAt = null
@@ -427,6 +463,8 @@ class WorkoutEngine(
 
     private fun setPhase(newPhase: Phase, step: Int, durationMs: Long?) {
         val now = clock.elapsedRealtime()
+        cancelHold()
+        pendingGoChime = false
         if (paused) {
             pausedMsAccum += now - (pauseStartedAt ?: now)
             pauseStartedAt = null
@@ -464,6 +502,50 @@ class WorkoutEngine(
         lastSnapshotAt = 0L
         logEntry = null
         finishedEntry = null
+        holding = false
+        holdToken++
+        pendingGoChime = false
+    }
+
+    // ---- announcement hold ----
+
+    /**
+     * Speak [text] and hold the current phase's clock until the utterance is done (or the
+     * timeout in [tick] fires). With speech disabled nothing is held: the GO chime, if requested,
+     * plays immediately.
+     */
+    private fun announce(text: String, goChimeOnRelease: Boolean) {
+        if (!settings().speechEnabled) {
+            if (goChimeOnRelease) cues.chime(ChimeKind.GO)
+            return
+        }
+        holding = true
+        holdStartedAt = clock.elapsedRealtime()
+        pendingGoChime = goChimeOnRelease
+        val token = ++holdToken
+        cues.speak(text, interrupt = true) { releaseHold(token) }
+    }
+
+    /** Start the held clock. Ignored for a hold that was already released or superseded. */
+    private fun releaseHold(token: Int) {
+        if (!holding || token != holdToken) return
+        holding = false
+        segmentStartedAt = clock.elapsedRealtime()
+        lastTickSecond = -1
+        if (pendingGoChime) {
+            pendingGoChime = false
+            cues.chime(ChimeKind.GO)
+        }
+        ensureTicker()
+        publish()
+    }
+
+    /** Drop the current hold without starting the clock (a new phase, a pause, or the end). */
+    private fun cancelHold() {
+        if (!holding) return
+        holding = false
+        holdToken++
+        cues.stopSpeaking()
     }
 
     // ---- helpers ----
@@ -555,6 +637,7 @@ class WorkoutEngine(
             totalElapsedMs = startedAtWall?.let { (wallNow - it).coerceAtLeast(0) } ?: finishedEntry?.let { it.elapsedSec * 1000L } ?: 0L,
             pausedMs = currentPausedMs(now),
             finishedEntry = finishedEntry,
+            announcing = holding,
         )
     }
 
