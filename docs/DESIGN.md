@@ -165,7 +165,9 @@ workout for the editor's "Re-import from file" action.
 
 ## Screens (`ui/`)
 
-Single-activity, hand-rolled back stack (`Screen` sealed class). Dark theme, large type.
+Single-activity, hand-rolled back stack (`Screen` sealed class). Dark theme, large type. The activity is
+locked to portrait (the timer layout does not fit a phone in landscape). POST_NOTIFICATIONS is requested on
+first launch and again whenever a session starts while it is still missing.
 
 - **Home**: workout cards sorted by last used then name (name, "10 exercises · 3 rounds · ~24 min",
   last used). Tap = open Active screen in IDLE. Card menu: Edit, Duplicate ("{name} (2)"),
