@@ -12,9 +12,11 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
@@ -23,6 +25,7 @@ import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExtendedFloatingActionButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -37,31 +40,42 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import com.exertrack.app.AppGraph
 import com.exertrack.app.data.ExerciseRow
+import com.exertrack.app.data.MediaFiles
 import com.exertrack.app.data.Repository
+import com.exertrack.app.data.RowMedia
 import com.exertrack.app.data.Workout
 import com.exertrack.app.data.newId
 import com.exertrack.app.ui.theme.ExColors
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 private const val LOCKED_HINT = "Finish or reset the running workout to change the list"
 private const val ROUNDS_HINT = "Rounds repeat the whole list; the last exercise's trigger is used between rounds"
 
 /**
- * Workout table editor (see docs/DESIGN.md). Autosaves through the repository. "Replace rows from
- * file" opens the document picker and hands the chosen URI to [onImportFile]; "Re-import from
- * source" does the same with the stored sourceUri. Structural edits are disabled while a session
- * for this workout is active.
+ * Workout table editor (see docs/DESIGN.md). Autosaves through the repository, workout notes
+ * included. Row cards are numbered "3/12" and show a preview of an attached photo or video;
+ * duplicating such a row copies the file so no two rows share one. "Replace rows from file" opens
+ * the document picker and hands the chosen URI to [onImportFile]; "Re-import from source" does the
+ * same with the stored sourceUri. Structural edits are disabled while a session for this workout
+ * is active; field edits, notes and media stay editable.
  */
 @Composable
 fun EditorScreen(
@@ -74,6 +88,7 @@ fun EditorScreen(
     val workouts by repository.workouts.collectAsState()
     val session by engine.state.collectAsState()
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
 
     val workout = workouts.firstOrNull { it.id == workoutId }
     if (workout == null) {
@@ -103,11 +118,40 @@ fun EditorScreen(
         }
     }
 
-    fun duplicateRow(row: ExerciseRow) {
+    /** The row whose photo or video is being copied for a duplicate; its card shows a spinner. */
+    var duplicatingRowId by remember(workoutId) { mutableStateOf<String?>(null) }
+
+    fun insertDuplicate(rowId: String, media: RowMedia?) {
         updateRows { rows ->
-            val index = rows.indexOfFirst { it.id == row.id }
+            val index = rows.indexOfFirst { it.id == rowId }
+            // If the row went away meanwhile the save below still runs and its sweep drops the copy.
             if (index < 0) return@updateRows rows
-            rows.toMutableList().apply { add(index + 1, rows[index].copy(id = newId())) }
+            rows.toMutableList().apply { add(index + 1, rows[index].copy(id = newId(), media = media)) }
+        }
+    }
+
+    fun duplicateRow(row: ExerciseRow) {
+        val media = row.media
+        if (media == null) {
+            insertDuplicate(row.id, null)
+            return
+        }
+        if (duplicatingRowId != null) return
+        // Two rows never share one file: copy it first, off the main thread.
+        duplicatingRowId = row.id
+        scope.launch {
+            val copied = try {
+                withContext(Dispatchers.IO) { MediaFiles.copy(context, media) }
+            } finally {
+                duplicatingRowId = null
+            }
+            val state = engine.state.value
+            if (state.isActive && state.workout?.id == workoutId) {
+                // A session started while the file was copying: structural edits are blocked now.
+                copied?.let { c -> withContext(Dispatchers.IO) { MediaFiles.discard(context, c) } }
+                return@launch
+            }
+            insertDuplicate(row.id, copied)
         }
     }
 
@@ -119,6 +163,7 @@ fun EditorScreen(
     var nameText by rememberSaveable(workoutId) { mutableStateOf(workout.name) }
     var roundsText by rememberSaveable(workoutId) { mutableStateOf(workout.rounds.toString()) }
     var leadInText by rememberSaveable(workoutId) { mutableStateOf(workout.leadInSec.toString()) }
+    var notesText by rememberSaveable(workoutId) { mutableStateOf(workout.notes) }
     val roundsValue = roundsText.trim().toIntOrNull()?.takeIf { it in 1..Repository.MAX_ROUNDS }
     val leadInValue = leadInText.trim().toIntOrNull()?.takeIf { it in 0..Repository.MAX_LEAD_IN_SEC }
 
@@ -213,6 +258,21 @@ fun EditorScreen(
                         style = MaterialTheme.typography.bodyMedium,
                         color = ExColors.textDim,
                     )
+                    OutlinedTextField(
+                        value = notesText,
+                        onValueChange = { text ->
+                            notesText = text
+                            persist { it.copy(notes = text.trim()) }
+                        },
+                        label = { Text("Workout notes") },
+                        minLines = 2,
+                        maxLines = 6,
+                        keyboardOptions = KeyboardOptions(
+                            capitalization = KeyboardCapitalization.Sentences,
+                            imeAction = ImeAction.Default,
+                        ),
+                        modifier = Modifier.fillMaxWidth(),
+                    )
                     Spacer(Modifier.height(4.dp))
                     Text(
                         text = if (workout.rows.size == 1) "1 exercise" else "${workout.rows.size} exercises",
@@ -236,9 +296,12 @@ fun EditorScreen(
             itemsIndexed(workout.rows, key = { _, row -> row.id }) { index, row ->
                 RowCard(
                     row = row,
+                    position = index + 1,
+                    total = workout.rows.size,
                     canMoveUp = !locked && index > 0,
                     canMoveDown = !locked && index < workout.rows.lastIndex,
-                    structuralEnabled = !locked,
+                    structuralEnabled = !locked && duplicatingRowId == null,
+                    duplicating = duplicatingRowId == row.id,
                     onEdit = { editingRowId = row.id },
                     onMoveUp = { moveRow(index, -1) },
                     onMoveDown = { moveRow(index, +1) },
@@ -290,11 +353,12 @@ fun EditorScreen(
     }
 
     // ---- edit an existing row ----
-    val editingRow = editingRowId?.let { id -> workout.rows.firstOrNull { it.id == id } }
+    val editingIndex = editingRowId?.let { id -> workout.rows.indexOfFirst { it.id == id } } ?: -1
+    val editingRow = workout.rows.getOrNull(editingIndex)
     editingRow?.let { row ->
         RowEditSheet(
             row = row,
-            title = "Edit exercise",
+            title = "Edit exercise ${editingIndex + 1}/${workout.rows.size}",
             onDismiss = { editingRowId = null },
             onSave = { saved ->
                 updateRows { rows -> rows.map { if (it.id == row.id) saved.copy(id = row.id) else it } }
@@ -315,11 +379,18 @@ fun EditorScreen(
     newRow?.let { blank ->
         RowEditSheet(
             row = blank,
-            title = "New exercise",
-            onDismiss = { newRowId = null },
+            title = "New exercise ${workout.rows.size + 1}",
+            // "Save and add another" has already moved on to a fresh id by the time the sheet
+            // reports this dismissal, and that fresh sheet must stay open.
+            onDismiss = { if (newRowId == blank.id) newRowId = null },
             onSave = { saved ->
                 updateRows { rows -> rows + saved.copy(id = blank.id) }
                 newRowId = null
+            },
+            onSaveAndAddAnother = { saved ->
+                updateRows { rows -> rows + saved.copy(id = blank.id) }
+                // A new id re-keys the sheet's field state, so the next one opens blank.
+                newRowId = if (locked) null else newId()
             },
         )
     }
@@ -344,9 +415,14 @@ fun EditorScreen(
 @Composable
 private fun RowCard(
     row: ExerciseRow,
+    /** 1-based place in the list, shown as "3/12" with [total]. */
+    position: Int,
+    total: Int,
     canMoveUp: Boolean,
     canMoveDown: Boolean,
     structuralEnabled: Boolean,
+    /** This row's photo or video is being copied for its duplicate. */
+    duplicating: Boolean,
     onEdit: () -> Unit,
     onMoveUp: () -> Unit,
     onMoveDown: () -> Unit,
@@ -359,28 +435,48 @@ private fun RowCard(
         colors = CardDefaults.cardColors(containerColor = ExColors.surface, contentColor = ExColors.text),
     ) {
         Column(Modifier.fillMaxWidth()) {
-            Column(Modifier.padding(start = 20.dp, end = 20.dp, top = 16.dp)) {
-                Text(
-                    text = row.name.ifBlank { "(unnamed)" },
-                    style = MaterialTheme.typography.titleMedium,
-                    color = ExColors.text,
-                    maxLines = 2,
-                    overflow = TextOverflow.Ellipsis,
-                )
-                Spacer(Modifier.height(4.dp))
-                Text(
-                    text = "${Format.rowDuration(row.durationSec)} · ${Format.rowTrigger(row.triggerSec)}",
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = ExColors.textDim,
-                )
-                if (row.notes.isNotBlank()) {
-                    Spacer(Modifier.height(4.dp))
+            Row(
+                modifier = Modifier.padding(start = 20.dp, end = 16.dp, top = 16.dp),
+                verticalAlignment = Alignment.Top,
+            ) {
+                Column(Modifier.weight(1f)) {
                     Text(
-                        text = row.notes,
-                        style = MaterialTheme.typography.bodyMedium,
+                        text = "$position/$total",
+                        style = MaterialTheme.typography.bodyMedium.copy(fontSize = 14.sp),
                         color = ExColors.textDim,
+                    )
+                    Spacer(Modifier.height(2.dp))
+                    Text(
+                        text = row.name.ifBlank { "(unnamed)" },
+                        style = MaterialTheme.typography.titleMedium,
+                        color = ExColors.text,
                         maxLines = 2,
                         overflow = TextOverflow.Ellipsis,
+                    )
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        text = "${Format.rowDuration(row.durationSec)} · ${Format.rowTrigger(row.triggerSec)}",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = ExColors.textDim,
+                    )
+                    if (row.notes.isNotBlank()) {
+                        Spacer(Modifier.height(4.dp))
+                        Text(
+                            text = row.notes,
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = ExColors.textDim,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+                }
+                row.media?.let { media ->
+                    Spacer(Modifier.width(12.dp))
+                    MediaThumbnail(
+                        media = media,
+                        modifier = Modifier
+                            .size(56.dp)
+                            .clip(RoundedCornerShape(8.dp)),
                     )
                 }
             }
@@ -397,7 +493,11 @@ private fun RowCard(
                     Icon(Icons.Filled.KeyboardArrowDown, contentDescription = "Move down")
                 }
                 Spacer(Modifier.weight(1f))
-                TextButton(onClick = onDuplicate, enabled = structuralEnabled) {
+                TextButton(onClick = onDuplicate, enabled = structuralEnabled && !duplicating) {
+                    if (duplicating) {
+                        CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
+                        Spacer(Modifier.width(8.dp))
+                    }
                     Text("Duplicate")
                 }
                 Spacer(Modifier.width(4.dp))

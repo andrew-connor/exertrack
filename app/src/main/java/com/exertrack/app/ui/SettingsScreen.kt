@@ -1,5 +1,7 @@
 package com.exertrack.app.ui
 
+import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -15,11 +17,13 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
@@ -46,15 +50,22 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.unit.dp
+import androidx.core.content.FileProvider
 import com.exertrack.app.AppGraph
 import com.exertrack.app.data.VibrationMode
+import com.exertrack.app.data.Workout
 import com.exertrack.app.engine.ChimeKind
 import com.exertrack.app.io.Backup
-import com.exertrack.app.io.Exporters
 import com.exertrack.app.ui.theme.ExColors
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.io.File
+import java.io.FileOutputStream
+import java.io.OutputStream
+
+private const val MIME_ZIP = "application/zip"
+private const val BACKUP_PREFIX = "exertrack-backup"
 
 /** Toggles, sound/speech test buttons, backup export and restore (see docs/DESIGN.md). */
 @OptIn(ExperimentalLayoutApi::class)
@@ -72,28 +83,26 @@ fun SettingsScreen(onBack: () -> Unit) {
     // are rebuilt from it below rather than kept across recreation.
     var restoreUri by rememberSaveable { mutableStateOf<Uri?>(null) }
     var pendingRestore by remember { mutableStateOf<Backup.Data?>(null) }
+    // Label of the backup job running on the IO dispatcher, shown next to a spinner; null when idle.
+    var busy by remember { mutableStateOf<String?>(null) }
 
     fun notify(message: String) {
         scope.launch { snackbar.showSnackbar(message) }
     }
 
-    val exportLauncher = rememberLauncherForActivityResult(
-        ActivityResultContracts.CreateDocument(Exporters.MIME_JSON)
-    ) { uri ->
+    val exportLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument(MIME_ZIP)) { uri ->
         if (uri != null) {
             scope.launch {
+                busy = "Saving backup"
                 val result = withContext(Dispatchers.IO) {
                     runCatching {
-                        val now = System.currentTimeMillis()
-                        val text = Backup.toJson(
-                            repository.workouts.value,
-                            repository.log.value,
-                            repository.settings.value,
-                            now,
-                        )
-                        Files.writeTo(context, uri, text.toByteArray(Charsets.UTF_8))
+                        repository.flush()
+                        val out = context.contentResolver.openOutputStream(uri, "wt")
+                            ?: throw IllegalArgumentException("Could not write file")
+                        out.use { writeBackup(it) }
                     }
                 }
+                busy = null
                 snackbar.showSnackbar(
                     result.fold(
                         onSuccess = { "Backup saved" },
@@ -101,6 +110,26 @@ fun SettingsScreen(onBack: () -> Unit) {
                     )
                 )
             }
+        }
+    }
+
+    fun shareBackup() {
+        scope.launch {
+            busy = "Preparing backup"
+            val result = withContext(Dispatchers.IO) {
+                runCatching {
+                    repository.flush()
+                    val dir = File(context.cacheDir, "exports").apply { mkdirs() }
+                    val file = File(dir, Format.exportFileName(BACKUP_PREFIX, "zip", System.currentTimeMillis()))
+                    FileOutputStream(file).use { writeBackup(it) }
+                    file
+                }
+            }
+            busy = null
+            result.fold(
+                onSuccess = { file -> shareCacheFile(context, file, MIME_ZIP) },
+                onFailure = { snackbar.showSnackbar("Could not prepare the backup: ${it.message ?: "write failed"}") },
+            )
         }
     }
 
@@ -114,8 +143,17 @@ fun SettingsScreen(onBack: () -> Unit) {
             pendingRestore = null
             return@LaunchedEffect
         }
-        val result = withContext(Dispatchers.IO) {
-            runCatching { Backup.parse(String(Files.readBytes(context, uri), Charsets.UTF_8)) }
+        busy = "Reading backup"
+        val result = try {
+            withContext(Dispatchers.IO) {
+                runCatching {
+                    Backup.readAny {
+                        context.contentResolver.openInputStream(uri) ?: throw IllegalArgumentException("Could not open file")
+                    }
+                }
+            }
+        } finally {
+            busy = null
         }
         result.fold(
             onSuccess = { pendingRestore = it },
@@ -125,6 +163,32 @@ fun SettingsScreen(onBack: () -> Unit) {
                 restoreUri = null
             },
         )
+    }
+
+    fun restore(uri: Uri?, data: Backup.Data) {
+        scope.launch {
+            busy = "Restoring backup"
+            // Media files go into place first; replaceAll then sweeps whatever the restored rows do not reference.
+            val media = withContext(Dispatchers.IO) {
+                runCatching {
+                    if (data.zipped && uri != null) {
+                        context.contentResolver.openInputStream(uri)?.use { Backup.extractZipMedia(it, repository.mediaDir) } ?: 0
+                    } else {
+                        0
+                    }
+                }
+            }
+            // An older JSON backup carries no files, and a zip may lack some: a row must not point at nothing.
+            val workouts = withContext(Dispatchers.IO) { dropMissingMedia(data.workouts, repository.mediaDir) }
+            repository.replaceAll(workouts, data.log, data.settings)
+            busy = null
+            snackbar.showSnackbar(
+                media.fold(
+                    onSuccess = { "Backup restored" },
+                    onFailure = { "Backup restored, but its photos and videos could not be copied: ${it.message ?: "read failed"}" },
+                )
+            )
+        }
     }
 
     val versionName = remember {
@@ -208,35 +272,65 @@ fun SettingsScreen(onBack: () -> Unit) {
 
             SectionHeader("Backup")
             Text(
-                text = "One file with every workout, the whole log and these settings.",
+                text = "One zip file with every workout, the whole log, these settings and the attached photos and videos.",
                 style = MaterialTheme.typography.bodyMedium,
                 color = ExColors.textDim,
                 modifier = Modifier.padding(horizontal = 16.dp),
             )
             Spacer(Modifier.height(12.dp))
-            Button(
-                onClick = {
-                    exportLauncher.launch(Format.exportFileName("exertrack-backup", "json", System.currentTimeMillis()))
-                },
+            val idle = busy == null
+            Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(horizontal = 16.dp)
-                    .heightIn(min = 48.dp),
-            ) { Text("Export backup") }
+                    .padding(horizontal = 16.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                Button(
+                    onClick = {
+                        exportLauncher.launch(Format.exportFileName(BACKUP_PREFIX, "zip", System.currentTimeMillis()))
+                    },
+                    enabled = idle,
+                    modifier = Modifier
+                        .weight(1f)
+                        .heightIn(min = 48.dp),
+                ) { Text("Export backup") }
+                OutlinedButton(
+                    onClick = { shareBackup() },
+                    enabled = idle,
+                    modifier = Modifier
+                        .weight(1f)
+                        .heightIn(min = 48.dp),
+                ) { Text("Share backup") }
+            }
             Spacer(Modifier.height(8.dp))
             OutlinedButton(
                 onClick = {
                     if (session.isActive) {
                         notify("End the running workout before restoring a backup.")
                     } else {
-                        restoreLauncher.launch(arrayOf("application/json", "*/*"))
+                        restoreLauncher.launch(arrayOf(MIME_ZIP, "application/json", "application/octet-stream", "*/*"))
                     }
                 },
+                enabled = idle,
                 modifier = Modifier
                     .fillMaxWidth()
                     .padding(horizontal = 16.dp)
                     .heightIn(min = 48.dp),
             ) { Text("Restore backup") }
+            busy?.let { label ->
+                Row(
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(20.dp),
+                        strokeWidth = 2.dp,
+                        color = MaterialTheme.colorScheme.primary,
+                    )
+                    Spacer(Modifier.width(12.dp))
+                    Text(label, style = MaterialTheme.typography.bodyMedium, color = ExColors.textDim)
+                }
+            }
 
             SectionHeader("About")
             Text(
@@ -257,17 +351,23 @@ fun SettingsScreen(onBack: () -> Unit) {
     pendingRestore?.let { data ->
         val workoutsText = if (data.workouts.size == 1) "1 workout" else "${data.workouts.size} workouts"
         val logText = if (data.log.size == 1) "1 log entry" else "${data.log.size} log entries"
+        val mediaCount = data.workouts.sumOf { w -> w.rows.count { it.media != null } }
+        val mediaText = when {
+            mediaCount == 0 -> ""
+            !data.zipped -> ", $mediaCount exercise ${if (mediaCount == 1) "photo or video" else "photos and videos"} (not included in this older backup)"
+            else -> " and $mediaCount exercise ${if (mediaCount == 1) "photo or video" else "photos and videos"}"
+        }
         val dateText = data.exportedAt?.let { " from " + Format.date(it) } ?: ""
         ConfirmDialog(
             title = "Restore backup?",
-            text = "Replace all data with $workoutsText and $logText$dateText? Everything currently in the app is overwritten.",
+            text = "Replace all data with $workoutsText, $logText$mediaText$dateText? Everything currently in the app is overwritten.",
             confirmLabel = "Replace",
             destructive = true,
             onConfirm = {
+                val uri = restoreUri
                 restoreUri = null
                 pendingRestore = null
-                repository.replaceAll(data.workouts, data.log, data.settings)
-                notify("Backup restored")
+                restore(uri, data)
             },
             onDismiss = {
                 restoreUri = null
@@ -275,6 +375,41 @@ fun SettingsScreen(onBack: () -> Unit) {
             },
         )
     }
+}
+
+/** Stream the current data and media as a zip backup into [out]; the caller closes the stream. */
+private fun writeBackup(out: OutputStream) {
+    val repository = AppGraph.repository
+    Backup.writeZip(
+        out,
+        repository.workouts.value,
+        repository.log.value,
+        repository.settings.value,
+        System.currentTimeMillis(),
+        repository.mediaDir,
+    )
+}
+
+/** Rows keep their photo or video only when its file is present under [mediaDir]. */
+private fun dropMissingMedia(workouts: List<Workout>, mediaDir: File): List<Workout> =
+    workouts.map { w ->
+        w.copy(
+            rows = w.rows.map { r ->
+                val media = r.media
+                if (media == null || File(mediaDir, media.file).isFile) r else r.copy(media = null)
+            },
+        )
+    }
+
+/** Open the system share sheet for a file already written under the cache `exports/` directory. */
+private fun shareCacheFile(context: Context, file: File, mime: String) {
+    val uri = FileProvider.getUriForFile(context, Files.AUTHORITY, file)
+    val send = Intent(Intent.ACTION_SEND).apply {
+        type = mime
+        putExtra(Intent.EXTRA_STREAM, uri)
+        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+    }
+    context.startActivity(Intent.createChooser(send, "Share ${file.name}").addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
 }
 
 @Composable

@@ -10,6 +10,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.saveable.listSaver
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshots.SnapshotStateMap
+import com.exertrack.app.data.ExerciseRow
 import com.exertrack.app.data.Repository
 import com.exertrack.app.data.Workout
 import com.exertrack.app.engine.SessionState
@@ -273,9 +274,10 @@ internal val SheetChoicesSaver = listSaver<SnapshotStateMap<Int, SheetChoice>, S
 
 /**
  * Apply every mapping in one pass, as resolved by [resolveAll]. New workouts get a unique name and
- * remember the source file and sheet; replaced workouts keep their id, name, rounds and lead-in. A
- * replaced workout that is loaded (idle or finished) in the engine is reloaded so the active screen
- * shows the new rows.
+ * remember the source file and sheet; replaced workouts keep their id, name, rounds, lead-in and
+ * notes, and their rows' photos and videos move over to the new rows by exercise name (see
+ * [carryOverMedia]). A replaced workout that is loaded (idle or finished) in the engine is reloaded
+ * so the active screen shows the new rows.
  */
 internal fun applyImport(model: ImportModel, repository: Repository, engine: WorkoutEngine): ImportOutcome {
     val now = System.currentTimeMillis()
@@ -307,7 +309,7 @@ internal fun applyImport(model: ImportModel, repository: Repository, engine: Wor
             is ImportTarget.Replace -> {
                 val existing = repository.workout(target.workoutId) ?: continue
                 val saved = repository.saveWorkout(
-                    existing.copy(rows = rows, sourceUri = source, sourceSheet = sheet),
+                    existing.copy(rows = carryOverMedia(existing.rows, rows), sourceUri = source, sourceSheet = sheet),
                     now,
                 )
                 if (session.workout?.id == saved.id && !session.isActive) engine.load(saved)
@@ -317,6 +319,24 @@ internal fun applyImport(model: ImportModel, repository: Repository, engine: Wor
         }
     }
     return ImportOutcome(created, replaced)
+}
+
+/**
+ * Re-attach the photos and videos of [oldRows] to [newRows] by exercise name (trimmed,
+ * case-insensitive), so a re-import from the spreadsheet keeps what was attached in the app. Each
+ * old attachment goes to the first new row with that name that has not taken one yet; old rows
+ * without media play no part. Nothing else carries over: the spreadsheet is the source of truth
+ * for names, durations, triggers and notes. Media left unmatched is dropped by the repository
+ * sweep after the save.
+ */
+internal fun carryOverMedia(oldRows: List<ExerciseRow>, newRows: List<ExerciseRow>): List<ExerciseRow> {
+    val unused = oldRows.filter { it.media != null }.toMutableList()
+    if (unused.isEmpty()) return newRows
+    return newRows.map { row ->
+        val key = row.name.trim()
+        val i = unused.indexOfFirst { it.name.trim().equals(key, ignoreCase = true) }
+        if (i < 0) row else row.copy(media = unused.removeAt(i).media)
+    }
 }
 
 internal fun plural(count: Int, noun: String): String = if (count == 1) "1 $noun" else "$count ${noun}s"

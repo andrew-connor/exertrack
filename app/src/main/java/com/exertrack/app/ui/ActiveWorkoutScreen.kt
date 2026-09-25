@@ -29,11 +29,14 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.AssistChip
 import androidx.compose.material3.AssistChipDefaults
 import androidx.compose.material3.Button
@@ -57,6 +60,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.saveable.listSaver
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -72,6 +76,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.exertrack.app.AppGraph
 import com.exertrack.app.data.ExerciseRow
+import com.exertrack.app.data.MediaKind
+import com.exertrack.app.data.RowMedia
 import com.exertrack.app.engine.Phase
 import com.exertrack.app.engine.SessionState
 import com.exertrack.app.ui.theme.ExColors
@@ -79,6 +85,12 @@ import kotlinx.coroutines.launch
 
 /** The list stops following the current step for this long after the user scrolls it. */
 private const val FOLLOW_PAUSE_MS = 10_000L
+
+/** Keeps the open media viewer across a configuration change or process restart. */
+private val MediaSaver = listSaver<RowMedia?, String>(
+    save = { media -> if (media == null) emptyList() else listOf(media.file, media.kind.name) },
+    restore = { saved -> if (saved.size < 2) null else runCatching { RowMedia(saved[0], MediaKind.valueOf(saved[1])) }.getOrNull() },
+)
 
 /**
  * The workout screen (see docs/DESIGN.md): counter, phase label, big clock, exercise name and
@@ -121,6 +133,8 @@ fun ActiveWorkoutScreen(
     // The workout the engine is showing, in its freshest repository form (edits are based on it).
     val loadedWorkout = state.workout?.let { shown -> workouts.firstOrNull { it.id == shown.id } ?: shown }
     val otherWorkoutRunning = state.isActive && state.workout != null && state.workout?.id != workoutId
+    val workoutNotes = (loadedWorkout ?: workout)?.notes.orEmpty()
+    val hasWorkoutNotes = workoutNotes.isNotBlank()
 
     // Saveable so a configuration change or process restart brings the open sheet or dialog
     // back (RowEditSheet restores its own typed fields once it is composed again).
@@ -129,6 +143,11 @@ fun ActiveWorkoutScreen(
     var jumpStep by rememberSaveable { mutableStateOf<Int?>(null) }
     var menuOpen by remember { mutableStateOf(false) }
     var notesExpanded by remember(state.stepIndex) { mutableStateOf(false) }
+    var workoutNotesExpanded by remember(state.workout?.id) { mutableStateOf(false) }
+    var showWorkoutNotes by rememberSaveable { mutableStateOf(false) }
+    // The photo or video open in the full-screen viewer. The session keeps running underneath:
+    // a glance at a form video during a rest must not stop the clock.
+    var viewing by rememberSaveable(stateSaver = MediaSaver) { mutableStateOf<RowMedia?>(null) }
 
     val rows = state.rows
     val rounds = state.rounds
@@ -226,6 +245,19 @@ fun ActiveWorkoutScreen(
                                     onEditWorkout(workoutId)
                                 },
                             )
+                            DropdownMenuItem(
+                                text = {
+                                    Text(
+                                        text = "Workout notes",
+                                        color = if (hasWorkoutNotes) ExColors.text else ExColors.textDim,
+                                    )
+                                },
+                                enabled = hasWorkoutNotes,
+                                onClick = {
+                                    menuOpen = false
+                                    showWorkoutNotes = true
+                                },
+                            )
                         }
                     }
                 },
@@ -266,6 +298,9 @@ fun ActiveWorkoutScreen(
                 state = state,
                 notesExpanded = notesExpanded,
                 onToggleNotes = { notesExpanded = !notesExpanded },
+                workoutNotesExpanded = workoutNotesExpanded,
+                onToggleWorkoutNotes = { workoutNotesExpanded = !workoutNotesExpanded },
+                onOpenMedia = { viewing = it },
             )
             Box(
                 modifier = Modifier
@@ -362,7 +397,7 @@ fun ActiveWorkoutScreen(
         if (base != null && row != null) {
             RowEditSheet(
                 row = row,
-                title = "Edit exercise ${rowIndex + 1}",
+                title = "Edit exercise ${rowIndex + 1}/${base.rows.size}",
                 onDismiss = { editStep = null },
                 onSave = { edited ->
                     val updatedRows = base.rows.mapIndexed { i, r -> if (i == rowIndex) edited.copy(id = r.id) else r }
@@ -382,6 +417,27 @@ fun ActiveWorkoutScreen(
             )
         }
     }
+
+    viewing?.let { media ->
+        MediaViewer(media = media, onDismiss = { viewing = null })
+    }
+
+    if (showWorkoutNotes) {
+        AlertDialog(
+            onDismissRequest = { showWorkoutNotes = false },
+            title = { Text("Workout notes") },
+            text = {
+                Text(
+                    text = workoutNotes,
+                    style = MaterialTheme.typography.bodyLarge,
+                    modifier = Modifier.verticalScroll(rememberScrollState()),
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = { showWorkoutNotes = false }) { Text("Close") }
+            },
+        )
+    }
 }
 
 // ---- header ----
@@ -391,6 +447,9 @@ private fun SessionHeader(
     state: SessionState,
     notesExpanded: Boolean,
     onToggleNotes: () -> Unit,
+    workoutNotesExpanded: Boolean,
+    onToggleWorkoutNotes: () -> Unit,
+    onOpenMedia: (RowMedia) -> Unit,
 ) {
     val accent = phaseColor(state)
     val row = state.currentRow
@@ -400,6 +459,14 @@ private fun SessionHeader(
         else -> row?.name ?: ""
     }
     val notes = if (state.phase == Phase.FINISHED) "" else row?.notes.orEmpty()
+    // The picture belongs to the exercise on screen: the first one before Start, the upcoming one
+    // during a lead-in, rest or wait, and the running one during an exercise.
+    val media = when (state.phase) {
+        Phase.FINISHED -> null
+        Phase.IDLE -> state.rows.firstOrNull()?.media
+        else -> row?.media
+    }
+    val workoutNotes = if (state.phase == Phase.IDLE) state.workout?.notes.orEmpty() else ""
 
     Column(
         modifier = Modifier
@@ -471,6 +538,16 @@ private fun SessionHeader(
                     .clickable(onClick = onToggleNotes),
             )
         }
+        if (media != null) {
+            MediaThumbnail(
+                media = media,
+                onClick = { onOpenMedia(media) },
+                modifier = Modifier
+                    .padding(top = 8.dp)
+                    .fillMaxWidth()
+                    .height(150.dp),
+            )
+        }
         val secondary = secondaryLine(state)
         if (secondary.isNotEmpty()) {
             Text(
@@ -478,6 +555,19 @@ private fun SessionHeader(
                 style = MaterialTheme.typography.bodyMedium,
                 color = ExColors.textDim,
                 modifier = Modifier.padding(top = 6.dp),
+            )
+        }
+        if (workoutNotes.isNotBlank()) {
+            Text(
+                text = workoutNotes,
+                style = MaterialTheme.typography.bodyMedium,
+                color = ExColors.textDim,
+                textAlign = TextAlign.Center,
+                maxLines = if (workoutNotesExpanded) Int.MAX_VALUE else 4,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier
+                    .padding(top = 6.dp)
+                    .clickable(onClick = onToggleWorkoutNotes),
             )
         }
     }

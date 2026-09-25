@@ -58,6 +58,7 @@ import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.exertrack.app.AppGraph
+import com.exertrack.app.data.MediaFiles
 import com.exertrack.app.data.Workout
 import com.exertrack.app.io.Exporters
 import com.exertrack.app.ui.theme.ExColors
@@ -178,8 +179,19 @@ fun HomeScreen(
                         onOpen = { onOpenWorkout(workout.id) },
                         onEdit = { onEditWorkout(workout.id) },
                         onDuplicate = {
-                            val copy = repository.duplicateWorkout(workout.id)
-                            if (copy != null) notify("Created ${copy.name}")
+                            scope.launch {
+                                // Copying a video can take a moment: do the file work off the main
+                                // thread first, then build the duplicate from the copies.
+                                val source = repository.workout(workout.id)
+                                val copies = withContext(Dispatchers.IO) {
+                                    source?.rows?.mapNotNull { it.media }?.distinct()
+                                        ?.associateWith { MediaFiles.copy(context, it) }
+                                        .orEmpty()
+                                }
+                                val copy = repository.duplicateWorkout(workout.id) { media -> copies[media] }
+                                // Copies nothing references (the workout changed or vanished meanwhile) are swept.
+                                if (copy != null) notify("Created ${copy.name}") else repository.sweepMedia()
+                            }
                         },
                         onRename = { renameTargetId = workout.id },
                         onExport = {

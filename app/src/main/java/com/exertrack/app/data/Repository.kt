@@ -28,6 +28,8 @@ class Repository(private val dir: File) : SessionStore {
     private val logFile = File(dir, "log.json")
     private val settingsFile = File(dir, "settings.json")
     private val sessionFile = File(dir, "session.json")
+    /** Photos and videos attached to exercises; see [MediaFiles]. */
+    val mediaDir = File(dir, "media")
 
     private val writer = Executors.newSingleThreadExecutor { r -> Thread(r, "exertrack-io").apply { isDaemon = true } }
 
@@ -56,6 +58,16 @@ class Repository(private val dir: File) : SessionStore {
             _workouts.value = loaded
         }
         snapshot = readText(sessionFile)?.let { runCatching { Json.parseSnapshotDocument(it) }.getOrNull() }
+        mediaDir.mkdirs()
+        // Nothing can still be waiting for a save after a restart, and rows must not point at
+        // pending files that will never be committed.
+        enqueue { MediaFiles.clearPending(mediaDir) }
+        val orphans = _workouts.value.any { w -> w.rows.any { it.media?.isPending == true } }
+        if (orphans) {
+            _workouts.value = _workouts.value.map { w -> w.copy(rows = w.rows.map { r -> if (r.media?.isPending == true) r.copy(media = null) else r }) }
+            persistWorkouts()
+        }
+        sweepMedia()
     }
 
     // ---- workouts ----
@@ -75,26 +87,51 @@ class Repository(private val dir: File) : SessionStore {
             if (list.any { it.id == stored.id }) list.map { if (it.id == stored.id) stored else it } else list + stored
         }
         persistWorkouts()
+        sweepMedia()
         return stored
     }
 
     fun deleteWorkout(id: String) {
         _workouts.update { list -> list.filterNot { it.id == id } }
         persistWorkouts()
+        sweepMedia()
     }
+
+    /**
+     * Delete media files (and previews) that no exercise references any more. Runs on the
+     * writer thread after the current writes, so it never races a save. Pending picks are left
+     * alone: they are committed or discarded by the row editor.
+     */
+    fun sweepMedia() {
+        val referenced = HashSet<String>()
+        for (w in _workouts.value) for (r in w.rows) r.media?.let { referenced += it.file; referenced += it.thumbFile }
+        enqueue { MediaFiles.sweep(mediaDir, referenced) }
+    }
+
+    /** Every media file the workouts reference, for backups. */
+    fun referencedMedia(): List<RowMedia> =
+        _workouts.value.flatMap { w -> w.rows.mapNotNull { it.media } }.filterNot { it.isPending }
 
     fun renameWorkout(id: String, name: String, now: Long = System.currentTimeMillis()) {
         val w = workout(id) ?: return
         saveWorkout(w.copy(name = name), now)
     }
 
-    /** Copy a workout (new ids for it and its rows) under a unique "name (2)" style name. */
-    fun duplicateWorkout(id: String, now: Long = System.currentTimeMillis()): Workout? {
+    /**
+     * Copy a workout (new ids for it and its rows) under a unique "name (2)" style name.
+     * [copyMedia] duplicates an attached photo or video so the two workouts never share a file;
+     * it returns null when the copy fails, in which case the new row has no media.
+     */
+    fun duplicateWorkout(
+        id: String,
+        now: Long = System.currentTimeMillis(),
+        copyMedia: (RowMedia) -> RowMedia? = { null },
+    ): Workout? {
         val w = workout(id) ?: return null
         val copy = w.copy(
             id = newId(),
             name = uniqueName(w.name),
-            rows = w.rows.map { it.copy(id = newId()) },
+            rows = w.rows.map { it.copy(id = newId(), media = it.media?.let(copyMedia)) },
             createdAt = now,
             updatedAt = now,
             lastUsedAt = null,
@@ -178,6 +215,7 @@ class Repository(private val dir: File) : SessionStore {
         persistLog()
         val text = Json.settingsDocument(settings)
         enqueue { writeAtomic(settingsFile, text) }
+        sweepMedia()
     }
 
     /** Block until every queued write has completed (tests, and before sharing a backup). */

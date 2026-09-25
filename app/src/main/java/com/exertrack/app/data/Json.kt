@@ -17,6 +17,7 @@ object Json {
         .put("durationSec", r.durationSec ?: JSONObject.NULL)
         .put("triggerSec", r.triggerSec ?: JSONObject.NULL)
         .put("notes", r.notes)
+        .put("media", r.media?.let { media(it) } ?: JSONObject.NULL)
 
     fun row(o: JSONObject): ExerciseRow = ExerciseRow(
         id = o.optString("id").ifEmpty { newId() },
@@ -24,7 +25,19 @@ object Json {
         durationSec = intOrNull(o, "durationSec"),
         triggerSec = intOrNull(o, "triggerSec"),
         notes = o.optString("notes"),
+        media = o.optJSONObject("media")?.let { media(it) },
     ).normalized()
+
+    fun media(m: RowMedia): JSONObject = JSONObject()
+        .put("file", m.file)
+        .put("kind", m.kind.name)
+
+    /** Null when the entry is unusable (no file name or unknown kind). */
+    fun media(o: JSONObject): RowMedia? {
+        val file = o.optString("file").takeIf { it.isNotBlank() } ?: return null
+        val kind = runCatching { MediaKind.valueOf(o.optString("kind")) }.getOrNull() ?: return null
+        return RowMedia(file, kind)
+    }
 
     fun workout(w: Workout): JSONObject = JSONObject()
         .put("id", w.id)
@@ -32,6 +45,7 @@ object Json {
         .put("rows", JSONArray().apply { w.rows.forEach { put(row(it)) } })
         .put("rounds", w.rounds)
         .put("leadInSec", w.leadInSec)
+        .put("notes", w.notes)
         .put("createdAt", w.createdAt)
         .put("updatedAt", w.updatedAt)
         .put("lastUsedAt", w.lastUsedAt ?: JSONObject.NULL)
@@ -46,6 +60,7 @@ object Json {
             rows = rows,
             rounds = o.optInt("rounds", 1).coerceIn(1, Repository.MAX_ROUNDS),
             leadInSec = o.optInt("leadInSec", 3).coerceIn(0, Repository.MAX_LEAD_IN_SEC),
+            notes = o.optString("notes"),
             createdAt = o.optLong("createdAt", 0L),
             updatedAt = o.optLong("updatedAt", 0L),
             lastUsedAt = longOrNull(o, "lastUsedAt"),

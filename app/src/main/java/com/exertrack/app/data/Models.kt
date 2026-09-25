@@ -4,6 +4,19 @@ import java.util.UUID
 
 fun newId(): String = UUID.randomUUID().toString()
 
+enum class MediaKind { IMAGE, VIDEO }
+
+/**
+ * A photo or video attached to an exercise, stored as a file in the app's private media
+ * directory (see data/MediaFiles.kt). [file] is the name relative to that directory, e.g.
+ * "3f2a...c1.jpg"; a still-pending pick lives under "pending/" until the row is saved.
+ */
+data class RowMedia(val file: String, val kind: MediaKind) {
+    /** The small JPEG preview generated when the media was imported, next to [file]. */
+    val thumbFile: String get() = file.substringBeforeLast('.') + ".thumb.jpg"
+    val isPending: Boolean get() = file.startsWith("pending/")
+}
+
 /** One exercise in a workout table. */
 data class ExerciseRow(
     val id: String = newId(),
@@ -13,6 +26,8 @@ data class ExerciseRow(
     /** Seconds of automatic rest before the next exercise; null = manual trigger (wait for a tap). Never 0. */
     val triggerSec: Int? = null,
     val notes: String = "",
+    /** Optional photo or video shown while the exercise is pending or running. */
+    val media: RowMedia? = null,
 ) {
     val isUntimed: Boolean get() = durationSec == null || durationSec <= 0
     val isManual: Boolean get() = triggerSec == null || triggerSec <= 0
@@ -33,6 +48,8 @@ data class Workout(
     val rounds: Int = 1,
     /** "Get ready" countdown after Start and after each manual advance. 0 disables. */
     val leadInSec: Int = 3,
+    /** Free text about the workout as a whole (shown before starting and from the timer's menu). */
+    val notes: String = "",
     val createdAt: Long,
     val updatedAt: Long,
     val lastUsedAt: Long? = null,

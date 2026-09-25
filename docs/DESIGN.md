@@ -12,7 +12,10 @@ foreground service so chimes fire with the screen off.
 - **Row**: `name`, `durationSec` (null = untimed, ends when the user taps Done), `triggerSec`
   (null = manual: after the exercise ends the app waits for a tap; N > 0 = automatic rest of N
   seconds, then the next exercise starts by itself), `notes` (free text shown while the row is
-  pending or running). A trigger of 0 is normalised to null (manual) everywhere.
+  pending or running), and an optional `media` (one photo or video, shown alongside the notes
+  while the row is pending or running). A trigger of 0 is normalised to null (manual) everywhere.
+- **Workout notes**: free text about the workout as a whole (`Workout.notes`), edited in the
+  editor, shown on the timer screen before Start and reachable from its menu during a session.
 - **Step**: one (round, row) pair. `stepIndex` runs from 0 to `rows.size * rounds - 1`.
   `rowIndex = stepIndex % rows.size`, `round = stepIndex / rows.size` (0-based).
   The counter on screen reads `"{rowIndex+1}/{rows.size}"` plus `"Round {round+1} of {rounds}"`
@@ -124,6 +127,18 @@ low-importance, silent notification: title = current/upcoming exercise name, tex
 count-up for WAITING/untimed, static text when paused), and actions Pause/Resume, Skip, End.
 End from the notification = `endSession(keepLog = true)`. Tapping the notification opens the app.
 
+## Exercise media (`data/MediaFiles.kt`)
+
+A picked photo or video is copied into `filesDir/media/pending/<uuid>.<ext>` together with a JPEG
+preview (`<uuid>.thumb.jpg`, longest side 640 px, EXIF-rotated; a video's preview is a frame one
+second in). Saving the row moves both into `filesDir/media/`; cancelling discards them. The
+repository sweeps unreferenced files after every workout save, delete and restore, clears the
+pending area on startup, and duplicates media files when a workout is duplicated. Media is picked
+with the system photo picker (no storage permission). On the timer screen the current or upcoming
+exercise's media is shown as a preview card under the notes; tapping opens a full-screen viewer.
+Videos never autoplay: the viewer shows the first frame and a play control. Backups are a zip
+(`backup.json` plus `media/*`); a plain JSON backup from an earlier version still restores.
+
 ## Storage (`data/Repository.kt`)
 
 Files in `context.filesDir`: `workouts.json`, `log.json`, `settings.json`, `session.json`.
@@ -168,7 +183,8 @@ workout for the editor's "Re-import from file" action.
   workout, completed, total, rounds, status, notes, session_id, workout_id) and as formatted
   `.xlsx` (bold header, frozen top row, autofilter, column widths, real date/time cells, notes
   wrapped).
-- Backup: one JSON file with everything; restore replaces all data after confirmation.
+- Backup: one zip file (`backup.json` with everything plus the referenced media files); restore
+  replaces all data after confirmation and also accepts the plain JSON backups of earlier versions.
 - Files are written through ACTION_CREATE_DOCUMENT (Save as) and can also be shared through the
   system share sheet via a `FileProvider` cache file.
 
@@ -181,10 +197,12 @@ first launch and again whenever a session starts while it is still missing.
 - **Home**: workout cards sorted by last used then name (name, "10 exercises · 3 rounds · ~24 min",
   last used). Tap = open Active screen in IDLE. Card menu: Edit, Duplicate ("{name} (2)"),
   Rename, Export CSV, Delete (confirm). Top actions: Import, Log, Settings. FAB: New workout.
-- **Editor**: name, rounds, lead-in seconds; row cards with up/down/duplicate/delete; tap a row to
-  edit its four fields in `RowEditSheet`; Add exercise; Replace rows from file; Re-import from
-  source (when known). Autosaves every change. Structural controls disabled with a hint while a
-  session for this workout is in progress.
+- **Editor**: name, rounds, lead-in seconds, workout notes; row cards numbered "3/12" with
+  up/down/duplicate/delete and a media preview when attached; tap a row to edit its fields (name,
+  duration, trigger, notes, photo or video) in `RowEditSheet`; Add exercise opens a blank sheet whose
+  "Save and add another" saves and immediately opens the next blank sheet; Replace rows from file;
+  Re-import from source (when known). Autosaves every change. Structural controls disabled with a
+  hint while a session for this workout is in progress.
 - **Active**: counter line, phase label (READY / GET READY / REST / TAP WHEN READY / PAUSED),
   big clock, exercise name, notes, secondary line "elapsed · ~remaining"; scrollable step list
   (round headers when rounds > 1; completed steps dimmed; current highlighted) that auto-follows
@@ -198,7 +216,7 @@ first launch and again whenever a session starts while it is still missing.
 - **Log**: entries newest first with date, workout, completed/total, status, notes preview; filter
   by workout; tap for detail (edit notes, delete); top actions Export CSV, Export XLSX, Share.
 - **Settings**: speech, duck other audio, vibration mode, warning ticks, keep screen on, mute;
-  Test buttons for each sound and for speech; Backup export / restore; version.
+  Test buttons for each sound and for speech; Backup export / share / restore; version.
 
 ## Module ownership
 
