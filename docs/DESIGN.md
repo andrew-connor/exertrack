@@ -194,11 +194,15 @@ Single-activity, hand-rolled back stack (`Screen` sealed class). Dark theme, lar
 locked to portrait (the timer layout does not fit a phone in landscape). POST_NOTIFICATIONS is requested on
 first launch and again whenever a session starts while it is still missing.
 
-- **Home**: workout cards sorted by last used then name (name, "10 exercises · 3 rounds · ~24 min",
-  last used). Tap = open Active screen in IDLE. Card menu: Edit, Duplicate ("{name} (2)"),
+- **Home**: workout cards in the user's own order (press and hold a card and drag it; the
+  repository list order is the display order, and files from before manual ordering are sorted
+  once by last use then name on first load). Card: name, "10 exercises · 3 rounds · ~24 min", last
+  used. Tap = open Active screen in IDLE. Card menu: Edit, Duplicate ("{name} (2)"),
   Rename, Export CSV, Delete (confirm). Top actions: Import, Log, Settings. FAB: New workout.
 - **Editor**: name, rounds, lead-in seconds, workout notes; row cards numbered "3/12" with
-  up/down/duplicate/delete and a media preview when attached; tap a row to edit its fields (name,
+  duplicate/delete, a media preview when attached, and press-and-hold drag reordering
+  (`ui/Reorder.kt`, no library: the dragged card follows the finger, rows it passes shift as soon
+  as their centre is crossed, the list auto-scrolls near the edges); tap a row to edit its fields (name,
   duration, trigger, notes, photo or video) in `RowEditSheet`; Add exercise opens a blank sheet whose
   "Save and add another" saves and immediately opens the next blank sheet; Replace rows from file;
   Re-import from source (when known). Autosaves every change. Structural controls disabled with a

@@ -180,7 +180,7 @@ fun SettingsScreen(onBack: () -> Unit) {
             }
             // An older JSON backup carries no files, and a zip may lack some: a row must not point at nothing.
             val workouts = withContext(Dispatchers.IO) { dropMissingMedia(data.workouts, repository.mediaDir) }
-            repository.replaceAll(workouts, data.log, data.settings)
+            repository.replaceAll(workouts, data.log, data.settings, manuallyOrdered = data.manuallyOrdered)
             busy = null
             snackbar.showSnackbar(
                 media.fold(

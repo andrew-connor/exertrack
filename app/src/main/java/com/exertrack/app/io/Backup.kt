@@ -40,12 +40,15 @@ object Backup {
         val exportedAt: Long?,
         /** True when the data came out of a zip, which may also carry media files to extract. */
         val zipped: Boolean = false,
+        /** False for backups from before the home list kept the user's own order. */
+        val manuallyOrdered: Boolean = true,
     )
 
     fun toJson(workouts: List<Workout>, log: List<LogEntry>, settings: Settings, exportedAt: Long): String =
         JSONObject()
             .put("app", "Exertrack")
             .put("schemaVersion", Json.SCHEMA_VERSION)
+            .put("orderVersion", Json.MANUAL_ORDER_VERSION)
             .put("exportedAt", exportedAt)
             .put("workouts", JSONArray().apply { workouts.forEach { put(Json.workout(it)) } })
             .put("log", JSONArray().apply { log.forEach { put(Json.logEntry(it)) } })
@@ -59,7 +62,10 @@ object Backup {
         val workouts = o.getJSONArray("workouts").let { arr -> (0 until arr.length()).map { Json.workout(arr.getJSONObject(it)) } }
         val log = o.optJSONArray("log")?.let { arr -> (0 until arr.length()).map { Json.logEntry(arr.getJSONObject(it)) } } ?: emptyList()
         val settings = o.optJSONObject("settings")?.let { Json.settings(it) } ?: Settings()
-        return Data(workouts, log, settings, Json.longOrNull(o, "exportedAt"))
+        return Data(
+            workouts, log, settings, Json.longOrNull(o, "exportedAt"),
+            manuallyOrdered = o.optInt("orderVersion", 0) >= Json.MANUAL_ORDER_VERSION,
+        )
     }
 
     // ---- zip ----

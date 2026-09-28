@@ -50,12 +50,20 @@ class Repository(private val dir: File) : SessionStore {
         dir.mkdirs()
         _settings.value = readText(settingsFile)?.let { runCatching { Json.parseSettingsDocument(it) }.getOrNull() } ?: Settings()
         _log.value = readText(logFile)?.let { runCatching { Json.parseLogDocument(it) }.getOrNull() }?.sortedByDescending { it.startedAt } ?: emptyList()
-        val loaded = readText(workoutsFile)?.let { runCatching { Json.parseWorkoutsDocument(it) }.getOrNull() }
+        val loaded = readText(workoutsFile)?.let { runCatching { Json.parseWorkoutsFile(it) }.getOrNull() }
         if (loaded == null) {
             _workouts.value = listOf(SampleWorkout.create(now))
             persistWorkouts()
+        } else if (!loaded.manuallyOrdered) {
+            // Files from before manual ordering: freeze the order the home screen used to show
+            // (most recently used first, then by name) so nothing appears to jump.
+            _workouts.value = loaded.workouts.sortedWith(
+                compareByDescending<Workout> { it.lastUsedAt ?: Long.MIN_VALUE }
+                    .thenBy(String.CASE_INSENSITIVE_ORDER) { it.name },
+            )
+            persistWorkouts()
         } else {
-            _workouts.value = loaded
+            _workouts.value = loaded.workouts
         }
         snapshot = readText(sessionFile)?.let { runCatching { Json.parseSnapshotDocument(it) }.getOrNull() }
         mediaDir.mkdirs()
@@ -112,6 +120,21 @@ class Repository(private val dir: File) : SessionStore {
     fun referencedMedia(): List<RowMedia> =
         _workouts.value.flatMap { w -> w.rows.mapNotNull { it.media } }.filterNot { it.isPending }
 
+    /**
+     * Put the workout [fromId] where [toId] currently sits (the list order is the home screen
+     * order). Everything in between shifts by one. Unknown ids are ignored.
+     */
+    fun moveWorkout(fromId: String, toId: String) {
+        if (fromId == toId) return
+        _workouts.update { list ->
+            val from = list.indexOfFirst { it.id == fromId }
+            val to = list.indexOfFirst { it.id == toId }
+            if (from < 0 || to < 0) return@update list
+            list.toMutableList().apply { add(to, removeAt(from)) }
+        }
+        persistWorkouts()
+    }
+
     fun renameWorkout(id: String, name: String, now: Long = System.currentTimeMillis()) {
         val w = workout(id) ?: return
         saveWorkout(w.copy(name = name), now)
@@ -136,7 +159,16 @@ class Repository(private val dir: File) : SessionStore {
             updatedAt = now,
             lastUsedAt = null,
         )
-        return saveWorkout(copy, now)
+        val saved = saveWorkout(copy, now)
+        // The list order is the user's order: a copy belongs right under its original.
+        _workouts.update { list ->
+            val original = list.indexOfFirst { it.id == id }
+            val added = list.indexOfFirst { it.id == saved.id }
+            if (original < 0 || added < 0) list
+            else list.toMutableList().apply { add(original + 1, removeAt(added)) }
+        }
+        persistWorkouts()
+        return saved
     }
 
     /** "name", or "name (2)", "name (3)" ... whichever is not taken (case-insensitive). */
@@ -206,9 +238,17 @@ class Repository(private val dir: File) : SessionStore {
 
     // ---- backup ----
 
-    /** Replace all data (restore from backup). */
-    fun replaceAll(workouts: List<Workout>, log: List<LogEntry>, settings: Settings) {
-        _workouts.value = workouts.map { w -> w.copy(rows = w.rows.map { it.normalized() }) }
+    /**
+     * Replace all data (restore from backup). A backup written before manual ordering existed
+     * ([manuallyOrdered] false) is put in the order its home screen used to show, most recently
+     * used first, instead of its file order.
+     */
+    fun replaceAll(workouts: List<Workout>, log: List<LogEntry>, settings: Settings, manuallyOrdered: Boolean = true) {
+        val ordered = if (manuallyOrdered) workouts else workouts.sortedWith(
+            compareByDescending<Workout> { it.lastUsedAt ?: Long.MIN_VALUE }
+                .thenBy(String.CASE_INSENSITIVE_ORDER) { it.name },
+        )
+        _workouts.value = ordered.map { w -> w.copy(rows = w.rows.map { it.normalized() }) }
         _log.value = log.sortedByDescending { it.startedAt }
         _settings.value = settings
         persistWorkouts()

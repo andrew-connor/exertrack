@@ -16,6 +16,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
@@ -85,12 +86,10 @@ fun HomeScreen(
     val scope = rememberCoroutineScope()
     val snackbar = remember { SnackbarHostState() }
 
-    val sorted = remember(workouts) {
-        workouts.sortedWith(
-            compareByDescending<Workout> { it.lastUsedAt ?: Long.MIN_VALUE }
-                .thenBy(String.CASE_INSENSITIVE_ORDER) { it.name }
-        )
-    }
+    // The repository's list order is the user's order: press and hold a card to drag it.
+    val sorted = workouts
+    val listState = rememberLazyListState()
+    val reorder = rememberReorderState(listState) { from, to -> repository.moveWorkout(from as String, to as String) }
 
     // Ids rather than Workout objects: the activity can be recreated (rotation, background kill)
     // while the rename dialog or the Save-as picker is up, and only saveable state survives that.
@@ -167,15 +166,29 @@ fun HomeScreen(
             )
         } else {
             LazyColumn(
+                state = listState,
                 modifier = Modifier
                     .fillMaxSize()
                     .padding(padding),
                 contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 8.dp, bottom = 104.dp),
                 verticalArrangement = Arrangement.spacedBy(12.dp),
             ) {
+                if (sorted.size > 1) {
+                    item(key = "reorder-hint") {
+                        Text(
+                            text = "Press and hold a workout to move it",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = ExColors.textDim,
+                            modifier = Modifier.padding(start = 4.dp, bottom = 2.dp),
+                        )
+                    }
+                }
                 items(sorted, key = { it.id }) { workout ->
                     WorkoutCard(
                         workout = workout,
+                        modifier = Modifier
+                            .reorderable(reorder, workout.id)
+                            .then(if (reorder.isDragging(workout.id)) Modifier else Modifier.animateItem()),
                         onOpen = { onOpenWorkout(workout.id) },
                         onEdit = { onEditWorkout(workout.id) },
                         onDuplicate = {
@@ -242,6 +255,7 @@ fun HomeScreen(
 @Composable
 private fun WorkoutCard(
     workout: Workout,
+    modifier: Modifier = Modifier,
     onOpen: () -> Unit,
     onEdit: () -> Unit,
     onDuplicate: () -> Unit,
@@ -253,7 +267,7 @@ private fun WorkoutCard(
 
     Card(
         onClick = onOpen,
-        modifier = Modifier.fillMaxWidth(),
+        modifier = modifier.fillMaxWidth(),
         colors = CardDefaults.cardColors(containerColor = ExColors.surface, contentColor = ExColors.text),
     ) {
         Row(

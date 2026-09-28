@@ -69,15 +69,24 @@ object Json {
         )
     }
 
+    /** Marks a workouts document whose list order is the user's chosen order (older files were sorted on display). */
+    const val MANUAL_ORDER_VERSION = 1
+
     fun workoutsDocument(list: List<Workout>): String = JSONObject()
         .put("schemaVersion", SCHEMA_VERSION)
+        .put("orderVersion", MANUAL_ORDER_VERSION)
         .put("workouts", JSONArray().apply { list.forEach { put(workout(it)) } })
         .toString(2)
 
-    fun parseWorkoutsDocument(text: String): List<Workout> {
+    fun parseWorkoutsDocument(text: String): List<Workout> = parseWorkoutsFile(text).workouts
+
+    data class WorkoutsFile(val workouts: List<Workout>, val manuallyOrdered: Boolean)
+
+    fun parseWorkoutsFile(text: String): WorkoutsFile {
         val o = JSONObject(text)
-        val arr = o.optJSONArray("workouts") ?: return emptyList()
-        return (0 until arr.length()).map { workout(arr.getJSONObject(it)) }
+        val arr = o.optJSONArray("workouts")
+        val workouts = if (arr == null) emptyList() else (0 until arr.length()).map { workout(arr.getJSONObject(it)) }
+        return WorkoutsFile(workouts, manuallyOrdered = o.optInt("orderVersion", 0) >= MANUAL_ORDER_VERSION)
     }
 
     // ---- log ----

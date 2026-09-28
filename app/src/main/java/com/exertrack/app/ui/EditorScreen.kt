@@ -16,13 +16,13 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Delete
-import androidx.compose.material.icons.filled.KeyboardArrowDown
-import androidx.compose.material.icons.filled.KeyboardArrowUp
+import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
@@ -110,11 +110,14 @@ fun EditorScreen(
         persist { it.copy(rows = transform(it.rows)) }
     }
 
-    fun moveRow(index: Int, delta: Int) {
+    /** Drag reordering: the row [fromId] takes the place of [toId]; rows between shift by one. */
+    fun moveRow(fromId: String, toId: String) {
+        if (fromId == toId) return
         updateRows { rows ->
-            val target = index + delta
-            if (index !in rows.indices || target !in rows.indices) return@updateRows rows
-            rows.toMutableList().apply { add(target, removeAt(index)) }
+            val from = rows.indexOfFirst { it.id == fromId }
+            val to = rows.indexOfFirst { it.id == toId }
+            if (from < 0 || to < 0) return@updateRows rows
+            rows.toMutableList().apply { add(to, removeAt(from)) }
         }
     }
 
@@ -193,7 +196,10 @@ fun EditorScreen(
             )
         },
     ) { padding ->
+        val listState = rememberLazyListState()
+        val reorder = rememberReorderState(listState) { from, to -> moveRow(from as String, to as String) }
         LazyColumn(
+            state = listState,
             modifier = Modifier
                 .fillMaxSize()
                 .padding(padding),
@@ -279,6 +285,13 @@ fun EditorScreen(
                         style = MaterialTheme.typography.titleMedium,
                         color = ExColors.text,
                     )
+                    if (workout.rows.size > 1 && !locked) {
+                        Text(
+                            text = "Press and hold an exercise to move it",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = ExColors.textDim,
+                        )
+                    }
                 }
             }
 
@@ -298,13 +311,12 @@ fun EditorScreen(
                     row = row,
                     position = index + 1,
                     total = workout.rows.size,
-                    canMoveUp = !locked && index > 0,
-                    canMoveDown = !locked && index < workout.rows.lastIndex,
                     structuralEnabled = !locked && duplicatingRowId == null,
                     duplicating = duplicatingRowId == row.id,
+                    modifier = Modifier
+                        .reorderable(reorder, row.id, enabled = !locked && duplicatingRowId == null)
+                        .then(if (reorder.isDragging(row.id)) Modifier else Modifier.animateItem()),
                     onEdit = { editingRowId = row.id },
-                    onMoveUp = { moveRow(index, -1) },
-                    onMoveDown = { moveRow(index, +1) },
                     onDuplicate = { duplicateRow(row) },
                     onDelete = { deleteRowId = row.id },
                 )
@@ -418,20 +430,17 @@ private fun RowCard(
     /** 1-based place in the list, shown as "3/12" with [total]. */
     position: Int,
     total: Int,
-    canMoveUp: Boolean,
-    canMoveDown: Boolean,
     structuralEnabled: Boolean,
     /** This row's photo or video is being copied for its duplicate. */
     duplicating: Boolean,
+    modifier: Modifier = Modifier,
     onEdit: () -> Unit,
-    onMoveUp: () -> Unit,
-    onMoveDown: () -> Unit,
     onDuplicate: () -> Unit,
     onDelete: () -> Unit,
 ) {
     Card(
         onClick = onEdit,
-        modifier = Modifier.fillMaxWidth(),
+        modifier = modifier.fillMaxWidth(),
         colors = CardDefaults.cardColors(containerColor = ExColors.surface, contentColor = ExColors.text),
     ) {
         Column(Modifier.fillMaxWidth()) {
@@ -486,12 +495,12 @@ private fun RowCard(
                     .padding(start = 8.dp, end = 8.dp, top = 4.dp, bottom = 4.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                IconButton(onClick = onMoveUp, enabled = canMoveUp) {
-                    Icon(Icons.Filled.KeyboardArrowUp, contentDescription = "Move up")
-                }
-                IconButton(onClick = onMoveDown, enabled = canMoveDown) {
-                    Icon(Icons.Filled.KeyboardArrowDown, contentDescription = "Move down")
-                }
+                Icon(
+                    imageVector = Icons.Filled.Menu,
+                    contentDescription = "Press and hold to move",
+                    tint = if (structuralEnabled) ExColors.textDim else ExColors.textDim.copy(alpha = 0.4f),
+                    modifier = Modifier.padding(start = 12.dp),
+                )
                 Spacer(Modifier.weight(1f))
                 TextButton(onClick = onDuplicate, enabled = structuralEnabled && !duplicating) {
                     if (duplicating) {
