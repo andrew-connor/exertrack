@@ -16,6 +16,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
@@ -46,9 +47,9 @@ import kotlinx.coroutines.launch
  * The dragged item follows the finger (a translation on top of its laid-out position). Items it
  * passes are moved through [onMove] as soon as the dragged item's centre crosses their centre,
  * and the list scrolls by itself while the item is held near the edge it is being moved towards.
- * Only items carrying [reorderable] take part; other items (headers, footers) are neither
- * draggable nor drop targets. A long press that is released without moving does nothing, not
- * even the item's own click.
+ * On release the item glides into its slot. Only items carrying [reorderable] take part; other
+ * items (headers, footers) are neither draggable nor drop targets. A long press that is released
+ * without moving does nothing, not even the item's own click.
  */
 @Stable
 class ReorderState internal constructor(
@@ -61,12 +62,16 @@ class ReorderState internal constructor(
         const val EDGE_PX = 140f
         /** Fastest automatic scroll, in px per frame. */
         const val MAX_SCROLL_PX = 28f
+        /** How long a requested move may take to show up in the layout before we stop waiting for it. */
+        const val MOVE_SETTLE_MS = 160L
+        /** Duration of the glide into place after the finger lifts. */
+        const val DROP_MS = 180L
     }
 
     /** Keys of items that currently carry [reorderable]. Not observed; read during gestures only. */
     internal val keys = HashSet<Any>()
 
-    /** The key being dragged, or null. Observable so the item can restyle itself. */
+    /** The key being dragged (or still gliding into its slot after a drop), or null. */
     var draggingKey: Any? by mutableStateOf(null)
         private set
 
@@ -74,6 +79,16 @@ class ReorderState internal constructor(
     private var initialOffset = 0
     private var scrollSpeed = 0f
     private var autoScroll: Job? = null
+    /** Runs while a released item glides into its slot. */
+    private var drop: Job? = null
+    /**
+     * Layout index the dragged item will occupy once the last [onMove] has been recomposed and
+     * measured, with the time it was requested. Until the layout shows it (or the wait runs
+     * out) no further move is requested, so two pointer events in one frame cannot ask for the
+     * same move twice and swap the items straight back.
+     */
+    private var pendingIndex: Int? = null
+    private var pendingSince = 0L
 
     fun isDragging(key: Any): Boolean = draggingKey == key
 
@@ -84,27 +99,65 @@ class ReorderState internal constructor(
         return draggedDistance + initialOffset - info.offset
     }
 
-    /** Begin dragging [key]. False when another drag is already in progress or the item is not laid out. */
+    /**
+     * Begin dragging [key]. False when another drag is in progress or the item is not laid out.
+     * An item still gliding home after a drop can be picked up again from where it is drawn.
+     */
     internal fun start(key: Any): Boolean {
-        if (draggingKey != null) return false
         val info = itemInfo(key) ?: return false
+        val current = draggingKey
+        if (current != null) {
+            if (drop == null) return false
+            drop?.cancel()
+            drop = null
+            if (current == key) {
+                // Keep the card where it is drawn: same translation, new reference slot.
+                draggedDistance += initialOffset - info.offset
+                initialOffset = info.offset
+                pendingIndex = null
+                return true
+            }
+            draggingKey = null
+        }
         draggingKey = key
         initialOffset = info.offset
         draggedDistance = 0f
+        pendingIndex = null
         return true
     }
 
     internal fun drag(key: Any, dy: Float) {
-        if (draggingKey != key) return
+        if (draggingKey != key || drop != null) return
         draggedDistance += dy
         settle()
     }
 
+    /** The finger lifted (or the gesture was cancelled): glide the item into its slot, then let go of it. */
     internal fun end(key: Any) {
-        if (draggingKey != key) return
-        draggingKey = null
-        draggedDistance = 0f
+        if (draggingKey != key || drop != null) return
         stopAutoScroll()
+        drop = scope.launch {
+            try {
+                val startDistance = draggedDistance
+                val startedAt = withFrameNanos { it }
+                var t = 0f
+                while (t < 1f) {
+                    val now = withFrameNanos { it }
+                    t = ((now - startedAt) / 1_000_000f / DROP_MS).coerceIn(0f, 1f)
+                    // The slot is re-read every frame so a move that lands mid-glide is followed.
+                    val slot = itemInfo(key)?.let { (it.offset - initialOffset).toFloat() } ?: break
+                    val eased = 1f - (1f - t) * (1f - t)
+                    draggedDistance = startDistance + (slot - startDistance) * eased
+                }
+            } finally {
+                if (draggingKey == key) {
+                    draggingKey = null
+                    draggedDistance = 0f
+                    pendingIndex = null
+                }
+                drop = null
+            }
+        }
     }
 
     // ---- internals ----
@@ -119,23 +172,39 @@ class ReorderState internal constructor(
      */
     private fun settle() {
         val key = draggingKey ?: return
-        val info = itemInfo(key) ?: return
+        val info = itemInfo(key) ?: run {
+            // The item is no longer laid out (its slot scrolled out of the viewport): nothing to
+            // track, so do not run the list on to its end.
+            stopAutoScroll()
+            return
+        }
         val top = initialOffset + draggedDistance
         val bottom = top + info.size
         val centre = top + info.size / 2f
         val displacement = top - info.offset
-        val target = listState.layoutInfo.visibleItemsInfo.firstOrNull { other ->
-            if (other.key == key || other.key !in keys) return@firstOrNull false
-            val otherCentre = other.offset + other.size / 2f
-            when {
-                // Moving down: an item below us whose centre we have passed.
-                displacement > 0f -> other.offset > info.offset && centre > otherCentre && centre < other.offset + other.size
-                // Moving up: an item above us whose centre we have passed.
-                displacement < 0f -> other.offset < info.offset && centre < otherCentre && centre >= other.offset
-                else -> false
+
+        val waiting = pendingIndex
+        if (waiting != null) {
+            if (info.index == waiting || System.currentTimeMillis() - pendingSince > MOVE_SETTLE_MS) pendingIndex = null
+        }
+        if (pendingIndex == null) {
+            val target = listState.layoutInfo.visibleItemsInfo.firstOrNull { other ->
+                if (other.key == key || other.key !in keys) return@firstOrNull false
+                val otherCentre = other.offset + other.size / 2f
+                when {
+                    // Moving down: an item below us whose centre we have passed.
+                    displacement > 0f -> other.offset > info.offset && centre > otherCentre && centre < other.offset + other.size
+                    // Moving up: an item above us whose centre we have passed.
+                    displacement < 0f -> other.offset < info.offset && centre < otherCentre && centre >= other.offset
+                    else -> false
+                }
+            }
+            if (target != null) {
+                pendingIndex = target.index
+                pendingSince = System.currentTimeMillis()
+                onMove(key, target.key)
             }
         }
-        if (target != null) onMove(key, target.key)
         updateAutoScroll(top, bottom, displacement)
     }
 
@@ -158,7 +227,7 @@ class ReorderState internal constructor(
         }
         if (autoScroll?.isActive == true) return
         autoScroll = scope.launch {
-            while (isActive && draggingKey != null && scrollSpeed != 0f) {
+            while (isActive && draggingKey != null && drop == null && scrollSpeed != 0f) {
                 val moved = listState.scrollBy(scrollSpeed)
                 if (moved == 0f) break // at the end of the list
                 settle()
@@ -205,23 +274,28 @@ fun Modifier.reorderable(state: ReorderState, key: Any, enabled: Boolean = true)
             if (!state.start(key)) return@awaitEachGesture
             haptics.performHapticFeedback(HapticFeedbackType.LongPress)
             var lastY = press.position.y
-            while (true) {
-                // The initial pass runs before the item's own click handler sees the event, so
-                // consuming here keeps a long press (moved or not) from also counting as a tap.
-                val event = awaitPointerEvent(PointerEventPass.Initial)
-                val change = event.changes.firstOrNull { it.id == down.id } ?: break
-                if (change.changedToUpIgnoreConsumed()) {
-                    change.consume()
-                    break
+            try {
+                while (true) {
+                    // The initial pass runs before the item's own click handler sees the event,
+                    // so consuming here keeps a long press (moved or not) from also counting as a tap.
+                    val event = awaitPointerEvent(PointerEventPass.Initial)
+                    val change = event.changes.firstOrNull { it.id == down.id } ?: break
+                    if (change.changedToUpIgnoreConsumed()) {
+                        change.consume()
+                        break
+                    }
+                    if (change.positionChangedIgnoreConsumed()) {
+                        change.consume()
+                        val y = change.position.y
+                        state.drag(key, y - lastY)
+                        lastY = y
+                    }
                 }
-                if (change.positionChangedIgnoreConsumed()) {
-                    change.consume()
-                    val y = change.position.y
-                    state.drag(key, y - lastY)
-                    lastY = y
-                }
+            } finally {
+                // Also reached when the gesture is cancelled from outside (the item left the
+                // viewport, the screen was left): the drag must never stay stuck on.
+                state.end(key)
             }
-            state.end(key)
         }
     }
     return this
