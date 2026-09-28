@@ -77,6 +77,13 @@ class ReorderState internal constructor(
 
     private var draggedDistance by mutableFloatStateOf(0f)
     private var initialOffset = 0
+    /**
+     * Where the finger took hold, measured from the top of the item's laid-out slot. Pointer
+     * positions arrive in the item's own coordinates, and that frame jumps by a whole slot every
+     * time a move lands, so the card's place is always recomputed from the finger's position
+     * within the list rather than accumulated from deltas.
+     */
+    private var grabY = 0f
     private var scrollSpeed = 0f
     private var autoScroll: Job? = null
     /** Runs while a released item glides into its slot. */
@@ -103,7 +110,7 @@ class ReorderState internal constructor(
      * Begin dragging [key]. False when another drag is in progress or the item is not laid out.
      * An item still gliding home after a drop can be picked up again from where it is drawn.
      */
-    internal fun start(key: Any): Boolean {
+    internal fun start(key: Any, pressY: Float): Boolean {
         val info = itemInfo(key) ?: return false
         val current = draggingKey
         if (current != null) {
@@ -111,9 +118,12 @@ class ReorderState internal constructor(
             drop?.cancel()
             drop = null
             if (current == key) {
-                // Keep the card where it is drawn: same translation, new reference slot.
-                draggedDistance += initialOffset - info.offset
+                // Picked up again mid-glide: keep the card where it is drawn, so the grab point
+                // is taken relative to the drawn position rather than the laid-out slot.
+                val translation = draggedDistance + initialOffset - info.offset
+                grabY = pressY - translation
                 initialOffset = info.offset
+                draggedDistance = translation
                 pendingIndex = null
                 return true
             }
@@ -121,14 +131,19 @@ class ReorderState internal constructor(
         }
         draggingKey = key
         initialOffset = info.offset
+        grabY = pressY
         draggedDistance = 0f
         pendingIndex = null
         return true
     }
 
-    internal fun drag(key: Any, dy: Float) {
+    /** The finger is at [localY] in the item's current coordinate frame. */
+    internal fun drag(key: Any, localY: Float) {
         if (draggingKey != key || drop != null) return
-        draggedDistance += dy
+        val info = itemInfo(key) ?: return
+        // Finger position within the list, then the card's top from the grab point.
+        val fingerInList = localY + info.offset
+        draggedDistance = fingerInList - grabY - initialOffset
         settle()
     }
 
@@ -271,9 +286,8 @@ fun Modifier.reorderable(state: ReorderState, key: Any, enabled: Boolean = true)
         awaitEachGesture {
             val down = awaitFirstDown(requireUnconsumed = false)
             val press = awaitLongPressOrCancellation(down.id) ?: return@awaitEachGesture
-            if (!state.start(key)) return@awaitEachGesture
+            if (!state.start(key, press.position.y)) return@awaitEachGesture
             haptics.performHapticFeedback(HapticFeedbackType.LongPress)
-            var lastY = press.position.y
             try {
                 while (true) {
                     // The initial pass runs before the item's own click handler sees the event,
@@ -286,9 +300,7 @@ fun Modifier.reorderable(state: ReorderState, key: Any, enabled: Boolean = true)
                     }
                     if (change.positionChangedIgnoreConsumed()) {
                         change.consume()
-                        val y = change.position.y
-                        state.drag(key, y - lastY)
-                        lastY = y
+                        state.drag(key, change.position.y)
                     }
                 }
             } finally {
